@@ -5,6 +5,29 @@ yamux at its 16MB max window with keepalive off, mux at the same 16MB window.
 Comparing our default window against yamux's tuned one measures configuration,
 not implementation — see "A note on windows" below.
 
+## WAN profile, kernel-shaped (the result that settles it)
+
+Linux CI, loopback shaped with `tc netem delay 100ms rate 100mbit`, so a
+200ms round trip over a link with a real bandwidth ceiling.
+
+| | throughput | notes |
+|---|---|---|
+| portunus, autotuning from the 64KB floor | **4.75 MB/s** | found an 8MB window unaided; measured RTT 205ms against 200ms injected |
+| yamux, 256KB shipped default | 1.19 MB/s | the configuration real deployments run |
+| yamux, hand-tuned 64MB window | 5.21 MB/s | the best a static window can do, given an operator who knows the path |
+
+**4.0× yamux as shipped, and within 9% of yamux hand-tuned — with no
+configuration at all.** The window autotuning exists to make a long path stop
+capping at window/RTT, and on a real path it does exactly that.
+
+This also retires the caveat carried through M5 and M6. On the in-process
+delay harness autotuning trailed a hand-tuned window by more than 5×, and
+that harness was documented as untrustworthy for absolute numbers because it
+has no bandwidth limit, leaving results dominated by chunk granularity. The
+kernel-shaped run confirms the harness was the problem, not the estimator:
+same code, same configuration, opposite conclusion. Trust the netem row; the
+`net.Pipe` rows below are kept only to show the ramp shape.
+
 ## After the hardening pass (abuse limits, honest measurement, allocations)
 
 Loopback TCP, both sides tuned to a 16MB window, `-benchtime=2s`.
