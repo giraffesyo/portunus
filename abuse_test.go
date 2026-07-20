@@ -434,3 +434,45 @@ func TestFirstBatchZeroCopyWriterWaits(t *testing.T) {
 		t.Fatalf("completed batches (%d) exceeds batches started (%d)", doneSeq, seq)
 	}
 }
+
+// A stream opened and immediately reset must not put the reset on the wire
+// ahead of the SYN that announces it. The peer would see a frame for a stream
+// it has never heard of, which it is obliged to treat as a protocol error,
+// killing a session over an entirely legal sequence.
+//
+// This is the open-then-hang-up pattern a proxy performs constantly, and the
+// window is one batch wide, so it reproduces only under churn.
+func TestResetNeverOvertakesItsOwnSYN(t *testing.T) {
+	for range 200 {
+		client, server := pair(t, nil)
+		c := ctx(t)
+
+		go func() {
+			for {
+				st, err := server.AcceptStream(c)
+				if err != nil {
+					return
+				}
+				go func(st Stream) { io.Copy(io.Discard, st); st.Close() }(st)
+			}
+		}()
+
+		// Open, write, and cancel with no pause, so the SYN and the reset
+		// compete for the same batch.
+		for range 20 {
+			st, err := client.OpenStream(c)
+			if err != nil {
+				t.Fatalf("open failed: %v (server: %v)", err, server.closedErr())
+			}
+			st.Write([]byte("x"))
+			st.CancelWrite(CodeApp)
+			st.Close()
+		}
+
+		if err := server.closedErr(); err != nil {
+			t.Fatalf("server rejected a legal open-then-reset sequence: %v", err)
+		}
+		client.Close()
+		server.Close()
+	}
+}

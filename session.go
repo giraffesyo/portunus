@@ -263,14 +263,22 @@ func (s *NativeSession) writeData(st *NativeStream, payload []byte, flags frame.
 // reached the wire is skipped: the peer must never see a frame for a stream
 // it has not heard of.
 func (s *NativeSession) streamControl(st *NativeStream, h frame.Header, payload []byte) {
-	s.w.mu.Lock()
-	seen := st.synSent
-	s.w.mu.Unlock()
-	if !seen {
-		return
-	}
 	h.StreamID = st.id
-	s.w.appendControl(h, payload)
+	s.w.appendStreamControl(st, h, payload, false)
+}
+
+// streamControlAsync is streamControl for the reader goroutine, which stages
+// the frame but never performs the flush itself.
+func (s *NativeSession) streamControlAsync(st *NativeStream, h frame.Header, payload []byte) {
+	h.StreamID = st.id
+	s.w.appendStreamControl(st, h, payload, true)
+}
+
+// sendWindowUpdateAsync returns credit from the reader goroutine.
+func (s *NativeSession) sendWindowUpdateAsync(st *NativeStream, limit uint64) {
+	var buf [frame.WindowUpdateLen]byte
+	s.streamControlAsync(st, frame.Header{Type: frame.TypeWindowUpdate},
+		frame.AppendWindowUpdate(buf[:0], limit))
 }
 
 // The control payloads below are built in stack arrays: stageControl copies
@@ -632,14 +640,13 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload []byte, seg pool.
 		s.accept <- st
 
 	case isRemote && h.StreamID <= s.maxSeen:
-		// Straggler for a stream we already tore down: drop silently. The
-		// payload is never counted against any receive budget.
 		s.mu.Unlock()
+		s.dropStraggler(h)
 		return nil
 
 	case !isRemote && h.StreamID <= s.lastLoc:
-		// Straggler for a locally opened stream that is gone.
 		s.mu.Unlock()
+		s.dropStraggler(h)
 		return nil
 
 	default:
@@ -683,6 +690,33 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload []byte, seg pool.
 		s.onStopSending(st, code)
 	}
 	return nil
+}
+
+// dropStraggler discards a frame for a stream that has already been torn
+// down, and tells the peer to stop if it was still sending data.
+//
+// Dropping silently is right for control frames, which need no answer. It is
+// wrong for data: a peer with an exhausted window is parked waiting for
+// credit that a reaped stream will never grant, and its own stream may have
+// been reaped too, so nothing else will ever wake it. Under sustained churn
+// that stranded hundreds of streams per run, each holding a concurrency slot
+// and a goroutine.
+//
+// The reply is STOP_SENDING rather than RST, and the difference is the whole
+// point: RST abandons *our* sending side, which the peer's blocked writer
+// never learns about, while STOP_SENDING fails that writer directly. Sending
+// the wrong one of the two looks almost identical and fixes nothing.
+//
+// Payloads dropped here are never counted against any receive budget.
+func (s *NativeSession) dropStraggler(h frame.Header) {
+	if h.Type != frame.TypeData || h.Length == 0 {
+		return
+	}
+	var buf [frame.StopSendingLen]byte
+	// Async: this runs on the reader goroutine.
+	s.w.appendControlAsync(
+		frame.Header{Type: frame.TypeStopSending, StreamID: h.StreamID},
+		frame.AppendStopSending(buf[:0], CodeCanceled))
 }
 
 // onData takes ownership of seg (the pooled buffer backing payload) and is
@@ -745,15 +779,26 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte,
 	}
 	// A discarded payload still consumed advertised credit; return it so a
 	// peer sending into a canceled read side is not stalled forever.
+	//
+	// Advertised directly rather than through the growth path, which
+	// deliberately refuses to advertise anything for a closed read side.
+	// Routing through it returned no credit at all, so a peer that kept
+	// sending — because its STOP_SENDING had not arrived yet, or because it
+	// was echoing what we sent it — exhausted its window and blocked
+	// permanently instead of learning to stop.
 	var limit uint64
 	if drop && len(payload) > 0 {
 		st.consumed = st.recvd
-		limit = st.maybeGrowRecvLimitLocked()
+		if st.recvLimit-st.consumed < st.window/2 {
+			st.recvLimit = st.consumed + st.window
+			limit = st.recvLimit
+		}
 	}
 	st.mu.Unlock()
 	notify(st.readable)
 	if limit > 0 {
-		s.sendWindowUpdate(st, limit)
+		// Async: this is the reader goroutine.
+		s.sendWindowUpdateAsync(st, limit)
 	}
 	if len(payload) > 0 {
 		s.maybeProbe()

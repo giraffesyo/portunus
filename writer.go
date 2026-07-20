@@ -194,6 +194,54 @@ func (w *writer) stage2(h frame.Header, payload []byte, stamp bool) bool {
 	return w.claimFlushLocked()
 }
 
+// appendStreamControl queues a control frame belonging to one stream: a
+// reset, a stop-sending, or a window update.
+//
+// Control frames normally lead the iovec so a window update is never trapped
+// behind queued bulk data. That ordering is safe across streams but not
+// within one: a stream announces itself with SYN riding its first DATA frame,
+// so a reset issued before that batch flushes would reach the peer first, as
+// a frame for a stream the peer has never heard of. The peer is then obliged
+// to treat it as a protocol error and kill the session — which is what
+// happened, roughly one run in ten, whenever a stream was opened and
+// cancelled in quick succession. That pattern is not exotic; it is what a
+// proxy does every time a client hangs up immediately.
+//
+// Ordering is preserved by putting the SYN-bearing frame in the control area
+// as well (see appendData). Entries there are written in append order and the
+// whole area precedes the data chunks, so a reset staged after a SYN can
+// never be written before it, whether they share a batch or not.
+// async must be set by the session reader, which may never block on the send
+// path: a reader parked in a carrier write stops draining its socket, and two
+// peers doing that at once deadlock permanently.
+func (w *writer) appendStreamControl(st *NativeStream, h frame.Header, payload []byte, async bool) {
+	w.mu.Lock()
+	if w.err != nil || !st.synSent {
+		// Not announced yet: the peer has no state for this stream, so
+		// there is nothing to tell it about.
+		w.mu.Unlock()
+		return
+	}
+	h.Length = uint32(len(payload))
+	var hdr [frame.HeaderSize]byte
+	h.Encode(hdr[:])
+
+	w.ctl = append(w.ctl, hdr[:]...)
+	w.ctl = append(w.ctl, payload...)
+	w.frames++
+	w.pending += frame.HeaderSize + len(payload)
+	flush := w.claimFlushLocked()
+	w.mu.Unlock()
+
+	if flush {
+		if async {
+			go w.flushLoop()
+		} else {
+			w.flushLoop()
+		}
+	}
+}
+
 // appendData queues one DATA frame for st. Small payloads return once
 // staged; large ones park until their flush resolves.
 //
@@ -249,7 +297,15 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 	}
 	st.batchBytes += total
 
-	if !st.synSent {
+	if st.sendAborted.Load() {
+		// Abandoned while this write was in flight. Staging now would
+		// announce a stream the peer can never be told about.
+		w.mu.Unlock()
+		return ErrStreamClosed
+	}
+
+	syn := !st.synSent
+	if syn {
 		flags |= frame.FlagSYN
 		st.synSent = true
 	}
@@ -261,17 +317,27 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 		Length:   uint32(len(payload)),
 	}.Encode(hdr[:])
 
-	// The header always goes to staging; the payload is copied or
-	// referenced depending on size and whether a deadline is active.
-	zeroCopy := !copyOnly && len(payload) >= zeroCopyThreshold
-	off := int32(len(w.stage))
-	w.stage = append(w.stage, hdr[:]...)
-	if !zeroCopy {
-		w.stage = append(w.stage, payload...)
-	}
-	w.chunks = append(w.chunks, chunk{off: off, n: int32(len(w.stage)) - off})
-	if zeroCopy {
-		w.chunks = append(w.chunks, chunk{ref: payload})
+	// The frame announcing a stream goes in the control area rather than
+	// with the data. Control leads the iovec, so a reset or window update
+	// staged later would otherwise be written before the SYN it refers to,
+	// and the peer is obliged to treat a frame for a stream it has never
+	// heard of as a protocol error. Keeping both in the control area, which
+	// preserves append order, makes that reordering impossible by
+	// construction. It costs one copy on the first frame of each stream.
+	zeroCopy := !syn && !copyOnly && len(payload) >= zeroCopyThreshold
+	if syn {
+		w.ctl = append(w.ctl, hdr[:]...)
+		w.ctl = append(w.ctl, payload...)
+	} else {
+		off := int32(len(w.stage))
+		w.stage = append(w.stage, hdr[:]...)
+		if !zeroCopy {
+			w.stage = append(w.stage, payload...)
+		}
+		w.chunks = append(w.chunks, chunk{off: off, n: int32(len(w.stage)) - off})
+		if zeroCopy {
+			w.chunks = append(w.chunks, chunk{ref: payload})
+		}
 	}
 	w.frames++
 	w.payload += uint64(len(payload))

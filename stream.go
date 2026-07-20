@@ -83,6 +83,12 @@ type NativeStream struct {
 	// direction, for the optional idle sweep. Atomic so the sweep never
 	// takes a stream lock.
 	lastActive atomic.Int64
+
+	// sendAborted marks the send side as locally abandoned. It is atomic so
+	// the send path can consult it while holding the writer mutex, which is
+	// what makes the decision to announce a stream and the decision to
+	// abandon it resolve against each other in a single order.
+	sendAborted atomic.Bool
 }
 
 // hasWriteDeadline reports whether this stream's writes must be copied
@@ -412,8 +418,19 @@ func (s *NativeStream) CloseWrite() error {
 	}
 	s.finSent = true
 	s.mu.Unlock()
+	// A writer already parked waiting for credit must observe that the send
+	// side is now finished. Without this it keeps waiting for credit that
+	// will never be useful, and once the stream is reaped nothing else will
+	// ever wake it: session teardown only reaches streams still in the map.
+	notify(s.writable)
 
-	err := s.sess.writeData(s, nil, frame.FlagFIN, true, s.wd.wait())
+	// Deliberately not subject to the stream's write deadline. finSent is
+	// already set, so abandoning the FIN would leave this side believing it
+	// half-closed while the peer waits for an end that never comes — which
+	// stranded streams in proportion to how often deadlines expired. A FIN
+	// is a few bytes on the copy path; the session write timeout still
+	// bounds it.
+	err := s.sess.writeData(s, nil, frame.FlagFIN, true, nil)
 	s.sess.maybeRemove(s)
 	return err
 }
@@ -422,6 +439,14 @@ func (s *NativeStream) CloseWrite() error {
 // the stream's SYN never reached the wire, the cancel is purely local — the
 // peer must never see an RST for a stream it has not heard of.
 func (s *NativeStream) CancelWrite(code uint64) {
+	// Set before anything else: a write already in flight consults this
+	// under the writer mutex and will decline to announce a stream that has
+	// just been abandoned. Without that, a cancel racing a stream's first
+	// write can skip the reset — correctly, since nothing had been sent yet
+	// — while the write goes on to announce the stream a moment later. The
+	// peer is then holding a stream it will never hear about again: no data,
+	// no FIN, no reset, just a reader blocked forever.
+	s.sendAborted.Store(true)
 	s.mu.Lock()
 	if s.writeErr != nil || s.finSent {
 		// Already terminal; QUIC-style RST-after-FIN is a non-goal in v1.
