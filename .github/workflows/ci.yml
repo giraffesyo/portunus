@@ -69,6 +69,21 @@ jobs:
           go get github.com/quic-go/quic-go@latest
           go build ./... && go test -count=1 ./...
 
+  leak-profile:
+    name: Goroutine leak profile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Soak and leak detection
+        # The runtime's own detector proves a goroutine is permanently
+        # blocked, which counting stacks by hand cannot.
+        env:
+          GOEXPERIMENT: goroutineleakprofile
+        run: go test -count=1 -run 'TestSoak|TestGoroutineLeakProfile|TestNoGoroutineLeak' ./...
+
   bench:
     name: Benchmarks vs yamux
     runs-on: ubuntu-latest
@@ -80,3 +95,28 @@ jobs:
       - name: Smoke-run the comparison suite
         working-directory: bench
         run: go test -bench=. -benchtime=10x -run XXX ./...
+
+  netem:
+    name: WAN profile (netem-shaped)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Shape loopback (200ms RTT, 100mbit)
+        # The in-process delay harness has no bandwidth limit, so its numbers
+        # are dominated by chunk granularity rather than the protocol. This
+        # is the gate the WAN autotuning claim actually rests on.
+        run: sudo tc qdisc add dev lo root netem delay 100ms rate 100mbit
+
+      - name: Autotuning vs a static window on a long path
+        working-directory: bench
+        env:
+          MUX_NETEM: '1'
+        run: go test -bench=Netem -benchtime=5x -timeout 20m -run XXX ./...
+
+      - name: Unshape
+        if: always()
+        run: sudo tc qdisc del dev lo root || true

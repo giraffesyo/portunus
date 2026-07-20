@@ -59,9 +59,14 @@ func (r *rateLimiter) allow(now time.Time) bool {
 
 // Default limits, chosen so a conformant peer never approaches them.
 const (
-	// A peer following the advertised minimum interval sends one PING per
-	// interval; this allows roughly twenty times that rate.
-	defaultPingBurst = 20
+	// PINGs serve two purposes — keepalive and BDP probing — and probing
+	// legitimately runs at up to one per round trip, which on a fast local
+	// link is thousands per second. The limit is therefore set well above
+	// any honest cadence rather than derived from the keepalive interval,
+	// which describes only one of the two uses. A flood arrives at line
+	// rate, orders of magnitude above this.
+	defaultPingPerSec = 2000
+	defaultPingBurst  = 500
 
 	// Stream resets track legitimate application cancellation, which is
 	// bursty (a client navigating away cancels many at once) but not
@@ -77,13 +82,7 @@ const (
 
 // initAbuseLimits builds the per-session limiters.
 func (s *NativeSession) initAbuseLimits(now time.Time) {
-	// Ping rate is tied to our own advertised minimum interval, so a peer
-	// that respects what we advertise is never at risk.
-	pingsPerSec := 1.0
-	if s.cfg.KeepaliveInterval > 0 {
-		pingsPerSec = 1 / s.cfg.KeepaliveInterval.Seconds()
-	}
-	s.pingLimit = newRateLimiter(pingsPerSec*4, defaultPingBurst, now)
+	s.pingLimit = newRateLimiter(defaultPingPerSec, defaultPingBurst, now)
 	s.resetLimit = newRateLimiter(defaultResetPerSec, defaultResetBurst, now)
 	s.noopLimit = newRateLimiter(defaultNoopPerSec, defaultNoopBurst, now)
 }

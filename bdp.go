@@ -33,6 +33,7 @@ type bdpEstimator struct {
 	probeFrom  uint64 // recvTotal when the probe was enqueued (pacing only)
 	stallsAt   uint64 // stall count when the probe reached the carrier
 	reservedAt time.Time
+	lastProbe  time.Time
 	sampleWait bool // enqueued, not yet stamped by the flusher
 
 	minRTT time.Duration
@@ -64,14 +65,25 @@ func (b *bdpEstimator) shouldProbe(recvTotal uint64, opaque uint64, now time.Tim
 		b.probing = false
 		b.sampleWait = false
 	}
-	// The threshold scales with the current estimate, so probing settles at
-	// roughly one sample per round trip once the window is sized. A fixed
-	// 64KB threshold means a probe per frame at 64KB frames, and each probe
-	// costs a control flush — measurably worse than the sample is worth.
+	// Probing is bounded on two axes, and both are needed.
+	//
+	// By bytes: the threshold scales with the current estimate, so a fixed
+	// 64KB threshold does not mean a probe per frame at 64KB frames.
+	//
+	// By time: no more than one probe per round trip, which is the fastest
+	// cadence that yields an independent sample anyway. Without the time
+	// bound, a fast link turns the byte bound into thousands of probes per
+	// second — enough for a correctly-implemented peer to classify us as a
+	// ping flood and close the session, which is exactly what happened
+	// under open-loop load before this existed.
 	need := max(uint64(bdpProbeBytes), b.bdp)
 	if b.probing || recvTotal < b.probeFrom+need {
 		return false
 	}
+	if !b.lastProbe.IsZero() && now.Sub(b.lastProbe) < b.minProbeGap() {
+		return false
+	}
+	b.lastProbe = now
 	b.reservedAt = now
 	b.probing = true
 	b.sampleWait = true
@@ -166,6 +178,16 @@ func (b *bdpEstimator) onACK(opaque, recvTotal, stalls uint64, now time.Time) ui
 	}
 	b.bdp = target
 	return target
+}
+
+// minProbeGap is the shortest interval between probes: one round trip, since
+// samples taken closer together are not independent, with a floor for links
+// whose round trip is too short to pace anything usefully.
+func (b *bdpEstimator) minProbeGap() time.Duration {
+	if b.minRTT > 0 {
+		return max(b.minRTT, time.Millisecond)
+	}
+	return time.Millisecond
 }
 
 // probeTimeout bounds how long a probe may stay outstanding: several round
