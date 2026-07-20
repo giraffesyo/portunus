@@ -53,14 +53,22 @@ func tcpPair(tb testing.TB) (net.Conn, net.Conn) {
 	return a, r.c
 }
 
+// muxConfig matches the tuning applied to the yamux baseline: the same
+// window, so the comparison measures the implementations rather than two
+// different flow-control budgets. (Until BDP autotune lands in M5, a static
+// window is all either side has.)
+func muxConfig() *mux.Config {
+	return &mux.Config{InitialWindow: 16 << 20}
+}
+
 // muxPair builds a mux client/server session pair.
 func muxPair(tb testing.TB) (*mux.NativeSession, *mux.NativeSession) {
 	a, b := tcpPair(tb)
-	cs, err := mux.Client(a, nil)
+	cs, err := mux.Client(a, muxConfig())
 	if err != nil {
 		tb.Fatal(err)
 	}
-	ss, err := mux.Server(b, nil)
+	ss, err := mux.Server(b, muxConfig())
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -356,6 +364,211 @@ func BenchmarkStreamChurnYamux(b *testing.B) {
 			b.Fatal(err)
 		}
 		st.Close()
+	}
+}
+
+// --- relay: the tunnel/proxy workload the receive fast path targets ---
+
+// BenchmarkRelayMux copies a stream from one session to a stream on another,
+// which is what a mux-based proxy does for every connection it carries.
+func BenchmarkRelayMux(b *testing.B) {
+	front, frontSrv := muxPair(b)
+	back, backSrv := muxPair(b)
+	ctx := context.Background()
+
+	go func() { // backend sink
+		for {
+			st, err := backSrv.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go io.Copy(io.Discard, st)
+		}
+	}()
+	go func() { // proxy
+		for {
+			in, err := frontSrv.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			out, err := back.OpenStream(ctx)
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(out, in); out.CloseWrite() }()
+		}
+	}()
+
+	st, err := front.OpenStream(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]byte, 64<<10)
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := st.Write(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRelayYamux(b *testing.B) {
+	front, frontSrv := yamuxPair(b)
+	back, backSrv := yamuxPair(b)
+
+	go func() {
+		for {
+			st, err := backSrv.AcceptStream()
+			if err != nil {
+				return
+			}
+			go io.Copy(io.Discard, st)
+		}
+	}()
+	go func() {
+		for {
+			in, err := frontSrv.AcceptStream()
+			if err != nil {
+				return
+			}
+			out, err := back.OpenStream()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(out, in); out.Close() }()
+		}
+	}()
+
+	st, err := front.OpenStream()
+	if err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]byte, 64<<10)
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := st.Write(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// --- mixed workload: small-message latency while bulk streams saturate ---
+//
+// This is the number that decides tunnel adoption, and the one the "disable
+// mux for interactive traffic" folklore comes from: a mux without per-stream
+// fairness makes a small request wait behind a bulk transfer.
+
+func BenchmarkMixedLatencyMux(b *testing.B) {
+	cs, ss := muxPair(b)
+	ctx := context.Background()
+
+	go func() {
+		for {
+			st, err := ss.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go io.Copy(st, st)
+		}
+	}()
+
+	// Four bulk streams saturating the session.
+	stop := make(chan struct{})
+	defer close(stop)
+	for range 4 {
+		bulk, err := cs.OpenStream(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		go func() {
+			buf := make([]byte, 64<<10)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := bulk.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+		go io.Copy(io.Discard, bulk)
+	}
+
+	st, err := cs.OpenStream(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	msg := make([]byte, 64)
+	reply := make([]byte, 64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := st.Write(msg); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.ReadFull(st, reply); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMixedLatencyYamux(b *testing.B) {
+	cs, ss := yamuxPair(b)
+
+	go func() {
+		for {
+			st, err := ss.AcceptStream()
+			if err != nil {
+				return
+			}
+			go io.Copy(st, st)
+		}
+	}()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	for range 4 {
+		bulk, err := cs.OpenStream()
+		if err != nil {
+			b.Fatal(err)
+		}
+		go func() {
+			buf := make([]byte, 64<<10)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := bulk.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+		go io.Copy(io.Discard, bulk)
+	}
+
+	st, err := cs.OpenStream()
+	if err != nil {
+		b.Fatal(err)
+	}
+	msg := make([]byte, 64)
+	reply := make([]byte, 64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := st.Write(msg); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.ReadFull(st, reply); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

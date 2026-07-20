@@ -67,10 +67,13 @@ type writer struct {
 	doneSeq uint64
 	err     error // sticky: any carrier error is session-fatal
 
-	// flushed is closed each time a batch completes, then replaced. It is
-	// the wakeup for parked writers and for admission backpressure, and it
-	// is selectable, so write deadlines stay enforceable while waiting.
+	// flushed is closed when a batch completes and someone is waiting, then
+	// replaced. It is selectable, unlike a sync.Cond, so write deadlines
+	// stay enforceable while waiting. waiters counts parked goroutines so
+	// the uncontended path — one writer, inline flush, nobody parked —
+	// neither closes nor reallocates it.
 	flushed chan struct{}
+	waiters int
 
 	flushing bool
 
@@ -151,30 +154,48 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 
 	w.mu.Lock()
 	// Admission backpressure: bound the batch so flush duration, staging
-	// occupancy, and every co-batched writer's latency floor stay bounded.
-	// This wait is pre-admission, so write deadlines legally apply here.
-	for w.err == nil && w.pending > 0 && w.pending+total > w.s.cfg.MaxBatchBytes {
-		ch := w.flushed
-		flush := w.claimFlushLocked()
-		w.mu.Unlock()
-		if flush {
+	// occupancy, and every co-batched writer's latency floor stay bounded,
+	// and bound each stream's share so a bulk transfer cannot monopolize
+	// consecutive batches. Waiting here is pre-admission, so write
+	// deadlines legally apply.
+	for w.err == nil && w.admissionBlockedLocked(st, total) {
+		if flush := w.claimFlushLocked(); flush {
+			w.mu.Unlock()
 			w.flushLoop()
-		} else {
-			select {
-			case <-ch:
-			case <-deadline:
-				return os.ErrDeadlineExceeded
-			case <-w.s.done:
-				return w.s.closedErr()
-			}
+			w.mu.Lock()
+			continue
+		}
+		// Registered before unlocking, so the flusher cannot decide
+		// "nobody is waiting" and skip the wakeup we are about to await.
+		w.waiters++
+		ch := w.flushed
+		w.mu.Unlock()
+		var err error
+		select {
+		case <-ch:
+		case <-deadline:
+			err = os.ErrDeadlineExceeded
+		case <-w.s.done:
+			err = w.s.closedErr()
 		}
 		w.mu.Lock()
+		w.waiters--
+		if err != nil {
+			w.mu.Unlock()
+			return err
+		}
 	}
 	if w.err != nil {
 		err := w.err
 		w.mu.Unlock()
 		return err
 	}
+
+	if st.batchSeq != w.seq+1 {
+		st.batchSeq = w.seq + 1 // batchSeq 0 means "no batch", so offset by one
+		st.batchBytes = 0
+	}
+	st.batchBytes += total
 
 	if !st.synSent {
 		flags |= frame.FlagSYN
@@ -220,24 +241,38 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 	// copy path above.
 	w.mu.Lock()
 	for w.doneSeq < mySeq && w.err == nil {
+		w.waiters++
 		ch := w.flushed
 		w.mu.Unlock()
+		var dead bool
 		select {
 		case <-ch:
 		case <-w.s.done:
-			w.mu.Lock()
-			if w.err == nil {
-				w.err = w.s.closedErr()
-			}
-			err := w.err
-			w.mu.Unlock()
-			return err
+			dead = true
 		}
 		w.mu.Lock()
+		w.waiters--
+		if dead && w.err == nil {
+			w.err = w.s.closedErr()
+		}
 	}
 	err := w.err
 	w.mu.Unlock()
 	return err
+}
+
+// admissionBlockedLocked reports whether this write must wait for the
+// pending batch to flush: either the batch is full, or this stream has
+// already used its share of it. An empty batch always admits, so a single
+// oversized write can never deadlock against its own cap.
+func (w *writer) admissionBlockedLocked(st *NativeStream, total int) bool {
+	if w.pending == 0 {
+		return false
+	}
+	if w.pending+total > w.s.cfg.MaxBatchBytes {
+		return true
+	}
+	return st.batchSeq == w.seq+1 && st.batchBytes+total > w.s.cfg.PerStreamBatchBytes
 }
 
 // claimFlushLocked makes the caller the flusher when none is running and
@@ -307,8 +342,13 @@ func (w *writer) flushLoop() {
 	}
 }
 
-// wakeLocked releases everyone parked on the current batch generation.
+// wakeLocked releases everyone parked on the current batch generation. With
+// no waiters there is nobody to wake and the channel is left untouched, which
+// keeps the common single-writer path allocation-free.
 func (w *writer) wakeLocked() {
+	if w.waiters == 0 {
+		return
+	}
 	close(w.flushed)
 	w.flushed = make(chan struct{})
 }

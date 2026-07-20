@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/giraffesyo/mux/internal/frame"
+	"github.com/giraffesyo/mux/internal/pool"
 )
 
 // NativeStream is one logical stream over a session. It implements Stream
@@ -28,6 +29,13 @@ type NativeStream struct {
 	// so a duplicate SYN for a live stream is caught as a protocol error.
 	synRecvd bool
 
+	// batchSeq/batchBytes track this stream's share of the batch currently
+	// accepting frames, enforcing per-stream fairness. Guarded by the
+	// writer mutex. batchSeq is the batch sequence plus one, so the zero
+	// value means "not in any batch".
+	batchSeq   uint64
+	batchBytes int
+
 	rmu sync.Mutex // serializes Read callers
 	wmu sync.Mutex // serializes Write/CloseWrite callers
 
@@ -36,11 +44,12 @@ type NativeStream struct {
 	mu sync.Mutex
 
 	// Receive side.
-	rq         [][]byte // queued payload chunks, oldest first
-	recvd      uint64   // cumulative bytes arrived
-	consumed   uint64   // cumulative bytes delivered to the application
-	recvLimit  uint64   // absolute limit we have advertised
-	window     uint64   // our per-stream window size
+	rq         []segment // queued segments, oldest first
+	drain      []segment // scratch for draining rq without allocating
+	recvd      uint64    // cumulative bytes arrived
+	consumed   uint64    // cumulative bytes delivered to the application
+	recvLimit  uint64    // absolute limit we have advertised
+	window     uint64    // our per-stream window size
 	finRecvd   bool
 	readErr    error // terminal read error (reset/cancel/session death)
 	readClosed bool  // local CancelRead/Close: drop incoming silently
@@ -69,6 +78,24 @@ type NativeStream struct {
 // hasWriteDeadline reports whether this stream's writes must be copied
 // rather than referenced, so a deadline stays enforceable after admission.
 func (s *NativeStream) hasWriteDeadline() bool { return s.wdSet.Load() }
+
+// segment is one received payload held in a pooled buffer. buf is the whole
+// pooled allocation and is what must be returned to the pool; data is the
+// unread remainder. Exactly one owner releases a segment, on every exit path
+// — consumed, discarded, or dropped at teardown — or the pool leaks and the
+// peer's flow-control credit is never returned.
+type segment struct {
+	buf  []byte
+	data []byte
+}
+
+func (sg segment) release() { pool.Put(sg.buf) }
+
+func releaseAll(segs []segment) {
+	for _, sg := range segs {
+		sg.release()
+	}
+}
 
 func newStream(sess *NativeSession, id uint32, local bool) *NativeStream {
 	return &NativeStream{
@@ -109,13 +136,14 @@ func (s *NativeStream) Read(p []byte) (int, error) {
 		if len(s.rq) > 0 {
 			n := 0
 			for n < len(p) && len(s.rq) > 0 {
-				c := copy(p[n:], s.rq[0])
+				c := copy(p[n:], s.rq[0].data)
 				n += c
-				if c == len(s.rq[0]) {
-					s.rq[0] = nil
+				if c == len(s.rq[0].data) {
+					s.rq[0].release()
+					s.rq[0] = segment{}
 					s.rq = s.rq[1:]
 				} else {
-					s.rq[0] = s.rq[0][c:]
+					s.rq[0].data = s.rq[0].data[c:]
 				}
 			}
 			s.consumed += uint64(n)
@@ -164,6 +192,95 @@ func (s *NativeStream) maybeGrowRecvLimitLocked() uint64 {
 		return s.recvLimit
 	}
 	return 0
+}
+
+// WriteTo implements io.WriterTo: it hands received segments straight to dst
+// instead of copying them into a caller buffer first, so io.Copy(dst, stream)
+// finds it automatically and the relay path avoids one copy per frame.
+//
+// No lock is held across the write to dst: a slow destination would otherwise
+// stall the entire session's receive path behind this stream's mutex.
+func (s *NativeStream) WriteTo(dst io.Writer) (int64, error) {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	var total int64
+	for {
+		s.mu.Lock()
+		s.drain = append(s.drain[:0], s.rq...)
+		clear(s.rq)
+		s.rq = s.rq[:0]
+		n := 0
+		for _, sg := range s.drain {
+			n += len(sg.data)
+		}
+		s.consumed += uint64(n)
+		limit := s.maybeGrowRecvLimitLocked()
+		readErr, fin, closed := s.readErr, s.finRecvd, s.readClosed
+		s.mu.Unlock()
+
+		if limit > 0 {
+			s.sess.sendWindowUpdate(s, limit)
+		}
+
+		for i, sg := range s.drain {
+			written, err := dst.Write(sg.data)
+			total += int64(written)
+			sg.release()
+			if err != nil {
+				releaseAll(s.drain[i+1:])
+				clear(s.drain)
+				return total, err
+			}
+		}
+		if len(s.drain) > 0 {
+			clear(s.drain)
+			s.sess.maybeRemove(s)
+			continue
+		}
+
+		switch {
+		case readErr != nil:
+			return total, readErr
+		case fin:
+			return total, nil // clean EOF: io.Copy reports success
+		case closed:
+			return total, ErrStreamClosed
+		}
+
+		select {
+		case <-s.readable:
+		case <-s.rd.wait():
+			return total, os.ErrDeadlineExceeded
+		}
+	}
+}
+
+// ReadFrom implements io.ReaderFrom: io.Copy(stream, src) uses it to move
+// src's bytes in frame-sized chunks through a pooled buffer, skipping
+// io.Copy's own intermediate buffer.
+func (s *NativeStream) ReadFrom(src io.Reader) (int64, error) {
+	size := int(s.sess.peerMaxFrame.Load())
+	buf := pool.Get(size)
+	defer pool.Put(buf)
+
+	var total int64
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			// Write does not return until these bytes are staged or on
+			// the wire, so reusing buf on the next iteration is safe.
+			if _, werr := s.Write(buf[:n]); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return total, nil
+			}
+			return total, rerr
+		}
+	}
 }
 
 // Write implements io.Writer. It blocks for flow-control credit, chunking to
@@ -267,7 +384,8 @@ func (s *NativeStream) CancelRead(code uint64) {
 	}
 	s.readClosed = true
 	s.readErr = &StreamError{Code: code}
-	s.rq = nil
+	releaseAll(s.rq)
+	s.rq = s.rq[:0]
 	s.consumed = s.recvd // no further credit will be granted
 	fin := s.finRecvd
 	s.mu.Unlock()

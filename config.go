@@ -36,8 +36,10 @@ type Config struct {
 	// the 30s default; negative disables.
 	WriteTimeout time.Duration
 
-	// ReadBufferSize is the parse buffer for the session reader.
-	// Zero selects 32KB.
+	// ReadBufferSize is the parse buffer for the session reader. It is
+	// deliberately small: a large buffer would slurp bulk payloads into
+	// itself, so the direct kernel-to-segment read for large frames would
+	// almost never fire. Zero selects 16KB.
 	ReadBufferSize int
 
 	// MaxBatchBytes bounds one group-commit batch. It caps flush duration
@@ -46,6 +48,12 @@ type Config struct {
 	// beyond it block at admission, where write deadlines still apply.
 	// Zero selects 512KB.
 	MaxBatchBytes int
+
+	// PerStreamBatchBytes bounds how much one stream may place in a single
+	// batch, so a bulk transfer cannot monopolize consecutive batches and
+	// push small messages on other streams behind it. Zero selects a
+	// quarter of MaxBatchBytes.
+	PerStreamBatchBytes int
 }
 
 const (
@@ -54,7 +62,7 @@ const (
 	defaultMaxIncoming    = 1024
 	defaultAcceptBacklog  = 128
 	defaultWriteTimeout   = 30 * time.Second
-	defaultReadBufferSize = 32 << 10
+	defaultReadBufferSize = 16 << 10
 	defaultMaxBatchBytes  = 512 << 10
 )
 
@@ -87,6 +95,9 @@ func buildConfig(in *Config) (Config, error) {
 	if c.MaxBatchBytes == 0 {
 		c.MaxBatchBytes = defaultMaxBatchBytes
 	}
+	if c.PerStreamBatchBytes == 0 {
+		c.PerStreamBatchBytes = c.MaxBatchBytes / 4
+	}
 
 	if c.InitialWindow < frame.FloorInitialWindow {
 		return c, fmt.Errorf("mux: InitialWindow %d below protocol floor %d", c.InitialWindow, frame.FloorInitialWindow)
@@ -102,8 +113,14 @@ func buildConfig(in *Config) (Config, error) {
 	}
 	// A batch must be able to hold at least one maximum-size frame, or a
 	// full-size write could never be admitted.
-	if minBatch := int(c.MaxFrameSize) + frame.HeaderSize; c.MaxBatchBytes < minBatch {
+	minBatch := int(c.MaxFrameSize) + frame.HeaderSize
+	if c.MaxBatchBytes < minBatch {
 		return c, fmt.Errorf("mux: MaxBatchBytes %d below one max frame (%d)", c.MaxBatchBytes, minBatch)
+	}
+	// Each stream must be able to admit one full frame, or a max-size write
+	// could never make progress.
+	if c.PerStreamBatchBytes < minBatch {
+		c.PerStreamBatchBytes = minBatch
 	}
 	return c, nil
 }

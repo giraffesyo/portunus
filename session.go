@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/giraffesyo/mux/internal/frame"
+	"github.com/giraffesyo/mux/internal/pool"
 )
 
 // NativeSession multiplexes streams over a reliable byte-stream carrier
@@ -34,6 +35,10 @@ type NativeSession struct {
 	peerMaxStreams    atomic.Uint64
 
 	w *writer // group-commit send path
+
+	// ctlScratch is reader-owned: control payloads are parsed immediately
+	// and never retained, so one reusable buffer serves them all.
+	ctlScratch []byte
 
 	mu       sync.Mutex // guards the fields below
 	streams  map[uint32]*NativeStream
@@ -242,15 +247,33 @@ func (s *NativeSession) readLoop() {
 			s.fatalProtocol(CodeFrameSize, "frame too large")
 			return
 		}
+		// DATA payloads land in pooled segments; when a payload runs past
+		// what the (deliberately small) parse buffer holds, bufio hands
+		// the remainder straight to ReadFull, so bulk bytes go
+		// kernel-to-segment with no intermediate copy. Control payloads
+		// are parsed immediately and never retained, so they use a
+		// reusable scratch buffer.
 		var payload []byte
+		var seg []byte
 		if h.Length > 0 {
-			payload = make([]byte, h.Length)
+			if h.Type == frame.TypeData {
+				seg = pool.Get(int(h.Length))
+				payload = seg
+			} else {
+				if cap(s.ctlScratch) < int(h.Length) {
+					s.ctlScratch = make([]byte, h.Length)
+				}
+				payload = s.ctlScratch[:h.Length]
+			}
 			if _, err := io.ReadFull(br, payload); err != nil {
+				if seg != nil {
+					pool.Put(seg)
+				}
 				s.readEnded(err)
 				return
 			}
 		}
-		if err := s.dispatch(h, payload); err != nil {
+		if err := s.dispatch(h, payload, seg); err != nil {
 			return // dispatch already terminated the session
 		}
 	}
@@ -271,8 +294,10 @@ func (s *NativeSession) fatalProtocol(code uint64, reason string) {
 	s.fatal(&SessionError{Code: code, Reason: reason})
 }
 
-// dispatch routes one frame. A non-nil return means the session is dead.
-func (s *NativeSession) dispatch(h frame.Header, payload []byte) error {
+// dispatch routes one frame. seg is the pooled backing buffer for a DATA
+// payload and is released here on every path that does not hand it to a
+// stream. A non-nil return means the session is dead.
+func (s *NativeSession) dispatch(h frame.Header, payload, seg []byte) error {
 	switch h.Type {
 	case frame.TypeSettings:
 		if h.StreamID != 0 {
@@ -318,7 +343,7 @@ func (s *NativeSession) dispatch(h frame.Header, payload []byte) error {
 		return nil
 
 	case frame.TypeData, frame.TypeWindowUpdate, frame.TypeRST, frame.TypeStopSending:
-		return s.dispatchStream(h, payload)
+		return s.dispatchStream(h, payload, seg)
 
 	default:
 		// Type 7 (PADDING) is reserved for v2; 8-15 are unused. Both are
@@ -383,8 +408,17 @@ func (s *NativeSession) raiseInitialLimits(window uint64) {
 }
 
 // dispatchStream handles the per-stream frame types, applying the receiver
-// rules from DESIGN.md.
-func (s *NativeSession) dispatchStream(h frame.Header, payload []byte) error {
+// rules from DESIGN.md. seg is released on every path that does not hand it
+// to a stream's receive queue.
+func (s *NativeSession) dispatchStream(h frame.Header, payload, seg []byte) error {
+	if seg != nil {
+		// Released unless onData takes ownership below.
+		defer func() {
+			if seg != nil {
+				pool.Put(seg)
+			}
+		}()
+	}
 	if h.StreamID == 0 {
 		s.fatalProtocol(CodeProtocol, "stream frame on session ID 0")
 		return errSessionTerminated
@@ -458,7 +492,9 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload []byte) error {
 
 	switch h.Type {
 	case frame.TypeData:
-		return s.onData(st, h, payload)
+		err := s.onData(st, h, payload, seg)
+		seg = nil // ownership passed to onData
+		return err
 	case frame.TypeWindowUpdate:
 		limit, err := frame.ParseWindowUpdate(payload)
 		if err != nil {
@@ -484,7 +520,16 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload []byte) error {
 	return nil
 }
 
-func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte) error {
+// onData takes ownership of seg (the pooled buffer backing payload) and is
+// responsible for releasing it on every path where it is not queued.
+func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload, seg []byte) error {
+	queued := false
+	defer func() {
+		if seg != nil && !queued {
+			pool.Put(seg)
+		}
+	}()
+
 	st.mu.Lock()
 	if st.finRecvd && (len(payload) > 0 || h.Flags&frame.FlagFIN != 0) {
 		st.mu.Unlock()
@@ -499,7 +544,8 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte)
 	}
 	drop := st.readClosed || st.readErr != nil
 	if !drop && len(payload) > 0 {
-		st.rq = append(st.rq, payload)
+		st.rq = append(st.rq, segment{buf: seg, data: payload})
+		queued = true
 	}
 	if h.Flags&frame.FlagFIN != 0 {
 		st.finRecvd = true
