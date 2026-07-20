@@ -31,30 +31,53 @@ func init() {
 	}
 }
 
-// Get returns a buffer of exactly n bytes, backed by a pooled allocation of
-// the smallest class that fits. Put returns it.
-func Get(n int) []byte {
-	for i, c := range classes {
-		if n <= c {
-			bp := pools[i].Get().(*[]byte)
-			return (*bp)[:n]
-		}
-	}
-	return make([]byte, n)
+// Buf is a pooled buffer. It is a pointer type because sync.Pool stores
+// interface values: putting a []byte back would box the slice header, and
+// taking the address of a local slice to avoid that boxing makes it escape —
+// an allocation on every release, which is exactly what pooling exists to
+// avoid. Holding the pointer the pool handed out keeps release allocation
+// free.
+//
+// The zero Buf is valid and releases to nothing.
+type Buf struct {
+	p    *[]byte
+	size int
 }
 
-// Put returns a buffer obtained from Get. Buffers larger than the biggest
-// class, or resliced beyond their original capacity, are dropped.
+// Bytes returns the usable slice, exactly the length that was requested.
 //
-// Pooled buffers are never zeroed on reuse — that is the point — so callers
-// must only ever expose a segment up to its valid written length. Handing out
-// bytes beyond it would leak another stream's prior payload.
-func Put(b []byte) {
-	c := cap(b)
+// Pooled memory is never zeroed on reuse — that is the point — so a caller
+// must expose only what it has written. Handing out bytes past the written
+// length would surface another stream's prior payload.
+func (b Buf) Bytes() []byte {
+	if b.p == nil {
+		return nil
+	}
+	return (*b.p)[:b.size]
+}
+
+// Get returns a buffer of exactly n bytes.
+func Get(n int) Buf {
+	for i, c := range classes {
+		if n <= c {
+			return Buf{p: pools[i].Get().(*[]byte), size: n}
+		}
+	}
+	// Larger than any class: allocate directly and let Put drop it.
+	b := make([]byte, n)
+	return Buf{p: &b, size: n}
+}
+
+// Put returns a buffer obtained from Get. Buffers outside the size classes
+// are dropped for the garbage collector.
+func Put(b Buf) {
+	if b.p == nil {
+		return
+	}
+	c := cap(*b.p)
 	for i, size := range classes {
 		if c == size {
-			b = b[:size]
-			pools[i].Put(&b)
+			pools[i].Put(b.p)
 			return
 		}
 	}

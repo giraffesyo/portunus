@@ -68,11 +68,19 @@ const (
 	defaultPingPerSec = 2000
 	defaultPingBurst  = 500
 
-	// Stream resets track legitimate application cancellation, which is
-	// bursty (a client navigating away cancels many at once) but not
-	// sustained at hundreds per second.
-	defaultResetPerSec = 200
-	defaultResetBurst  = 500
+	// Stream resets are deliberately NOT rate-limited by default. Every
+	// Close on a stream whose peer is still sending emits a STOP_SENDING,
+	// so a proxy churning connections resets at whatever rate it opens
+	// them — over a hundred thousand per second on loopback. Any threshold
+	// low enough to constrain an attacker also breaks that workload.
+	//
+	// The real Rapid Reset defense is structural and always on: an incoming
+	// stream holds its concurrency slot until the application closes it,
+	// never freed early by a peer reset. That is precisely the hole
+	// CVE-2023-39325 exploited. Rate limiting resets on top of it buys
+	// little and costs a legitimate use case, so it is opt-in via
+	// Config.MaxResetsPerSecond for deployments that want it.
+	defaultResetBurst = 500
 
 	// No-op frames — empty DATA that neither opens, closes, nor carries
 	// anything — have no legitimate use at volume.
@@ -83,7 +91,8 @@ const (
 // initAbuseLimits builds the per-session limiters.
 func (s *NativeSession) initAbuseLimits(now time.Time) {
 	s.pingLimit = newRateLimiter(defaultPingPerSec, defaultPingBurst, now)
-	s.resetLimit = newRateLimiter(defaultResetPerSec, defaultResetBurst, now)
+	// Zero (the default) disables the limiter; see the note above.
+	s.resetLimit = newRateLimiter(float64(s.cfg.MaxResetsPerSecond), defaultResetBurst, now)
 	s.noopLimit = newRateLimiter(defaultNoopPerSec, defaultNoopBurst, now)
 }
 

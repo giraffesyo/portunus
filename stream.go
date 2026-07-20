@@ -95,7 +95,7 @@ func (s *NativeStream) hasWriteDeadline() bool { return s.wdSet.Load() }
 // — consumed, discarded, or dropped at teardown — or the pool leaks and the
 // peer's flow-control credit is never returned.
 type segment struct {
-	buf  []byte
+	buf  pool.Buf
 	data []byte
 }
 
@@ -296,9 +296,9 @@ func (s *NativeStream) WriteTo(dst io.Writer) (int64, error) {
 // src's bytes in frame-sized chunks through a pooled buffer, skipping
 // io.Copy's own intermediate buffer.
 func (s *NativeStream) ReadFrom(src io.Reader) (int64, error) {
-	size := int(s.sess.peerMaxFrame.Load())
-	buf := pool.Get(size)
-	defer pool.Put(buf)
+	pb := pool.Get(int(s.sess.peerMaxFrame.Load()))
+	defer pool.Put(pb)
+	buf := pb.Bytes()
 
 	var total int64
 	for {

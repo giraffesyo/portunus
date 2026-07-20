@@ -449,7 +449,15 @@ func (w *writer) writeOut() error {
 	if w.tcp != nil {
 		// net.Buffers.WriteTo issues writev, looping past the 1024-iovec
 		// kernel limit, so a flush is not assumed to be one syscall.
-		_, err := w.iov.WriteTo(w.tcp)
+		//
+		// It writes through a *copy* of the slice header deliberately:
+		// WriteTo consumes the Buffers it is given, advancing it as it
+		// writes. Passing w.iov directly leaves it empty but pointing at
+		// the end of its backing array, so the next flush's appends
+		// reallocate — an allocation per flush, which profiling showed
+		// was the single largest remaining allocation source.
+		iov := w.iov
+		_, err := iov.WriteTo(w.tcp)
 		return err
 	}
 

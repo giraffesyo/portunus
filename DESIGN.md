@@ -183,8 +183,14 @@ Carrier realities:
   users. Zero-copy does not exist on TLS at all — crypto/tls copies and
   encrypts into its own record buffer regardless.
 
-Contention plan (many-core): the batch mutex is a global serialization
-point by construction. Mutex/block profiles are first-class benchmark
+Contention plan (many-core), **measured**: the knee is at four cores, after
+which throughput degrades about 20% and plateaus rather than collapsing —
+batching rises as contention does, and larger batches pay for the lock. A
+mutex profile attributes 84% of contention here, to `appendData`. The
+mitigations below remain unimplemented because a 20% plateau does not yet
+justify them; see bench/BASELINE.md for the curve.
+
+The batch mutex is a global serialization point by construction. Mutex/block profiles are first-class benchmark
 outputs, and the suite includes a GOMAXPROCS scaling curve (1→2→8→32) to
 find the knee. If a knee appears, the named mitigations — in order — are
 per-stream/per-P pre-staging (frames assembled outside the lock, admission

@@ -59,6 +59,16 @@ type Config struct {
 	// client, so only a timeout can.
 	StreamIdleTimeout time.Duration
 
+	// MaxResetsPerSecond optionally bounds how fast a peer may reset
+	// streams. It is off by default: closing a stream whose peer is still
+	// sending emits a STOP_SENDING, so a proxy resets as fast as it churns
+	// connections, and any threshold tight enough to matter breaks that.
+	//
+	// The structural Rapid Reset defense is always on regardless — an
+	// incoming stream holds its slot until the application closes it, never
+	// freed early by a peer reset.
+	MaxResetsPerSecond int
+
 	// MaxFrameSize is the largest DATA payload we accept. Bounds between
 	// frame.FloorMaxFrameSize (16KB) and frame.MaxLength. Default 64KB.
 	MaxFrameSize uint32

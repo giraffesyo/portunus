@@ -43,10 +43,13 @@ func TestAbuseEmptyFrameFloodIsStopped(t *testing.T) {
 	assertCalm(t, sess, "empty frame flood")
 }
 
-// Reset churn is the Rapid Reset shape: each reset discharges the peer's
-// obligations while leaving us the teardown work.
-func TestAbuseResetFloodIsStopped(t *testing.T) {
-	cfg := &Config{MaxIncomingStreams: 4096, AcceptBacklog: 4096}
+// Reset limiting is opt-in, and when enabled must cut off the churn.
+func TestAbuseResetFloodIsStoppedWhenEnabled(t *testing.T) {
+	cfg := &Config{
+		MaxIncomingStreams: 4096,
+		AcceptBacklog:      4096,
+		MaxResetsPerSecond: 200,
+	}
 	sess, p := rawPair(t, cfg)
 	p.settings()
 
@@ -327,5 +330,37 @@ func TestIdleStreamsSurviveByDefault(t *testing.T) {
 	ss.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := io.ReadFull(ss, buf); err != nil {
 		t.Fatalf("peer end unusable: %v", err)
+	}
+}
+
+// With reset limiting off (the default), rapid stream churn must be allowed:
+// a proxy resets as fast as it opens connections, and the structural Rapid
+// Reset defense — a slot held until the application closes it — does not
+// depend on rate limiting.
+func TestRapidChurnAllowedByDefault(t *testing.T) {
+	client, server := pair(t, &Config{MaxIncomingStreams: 512, AcceptBacklog: 512})
+	c := ctx(t)
+
+	go func() {
+		for {
+			st, err := server.AcceptStream(c)
+			if err != nil {
+				return
+			}
+			go func(st Stream) { io.Copy(io.Discard, st); st.Close() }(st)
+		}
+	}()
+
+	// Far faster than any rate a limiter could safely allow.
+	for i := range 3000 {
+		st, err := client.OpenStream(c)
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		st.Write([]byte("x"))
+		st.Close()
+	}
+	if err := client.closedErr(); err != nil {
+		t.Fatalf("rapid churn was rejected by default: %v", err)
 	}
 }

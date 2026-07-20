@@ -389,11 +389,11 @@ func (s *NativeSession) readLoop() {
 		// are parsed immediately and never retained, so they use a
 		// reusable scratch buffer.
 		var payload []byte
-		var seg []byte
+		var seg pool.Buf
 		if h.Length > 0 {
 			if h.Type == frame.TypeData {
 				seg = pool.Get(int(h.Length))
-				payload = seg
+				payload = seg.Bytes()
 			} else {
 				if cap(s.ctlScratch) < int(h.Length) {
 					s.ctlScratch = make([]byte, h.Length)
@@ -401,9 +401,7 @@ func (s *NativeSession) readLoop() {
 				payload = s.ctlScratch[:h.Length]
 			}
 			if _, err := io.ReadFull(br, payload); err != nil {
-				if seg != nil {
-					pool.Put(seg)
-				}
+				pool.Put(seg)
 				s.readEnded(err)
 				return
 			}
@@ -447,7 +445,7 @@ func (s *NativeSession) fatalProtocol(code uint64, reason string) {
 // dispatch routes one frame. seg is the pooled backing buffer for a DATA
 // payload and is released here on every path that does not hand it to a
 // stream. A non-nil return means the session is dead.
-func (s *NativeSession) dispatch(h frame.Header, payload, seg []byte) error {
+func (s *NativeSession) dispatch(h frame.Header, payload []byte, seg pool.Buf) error {
 	switch h.Type {
 	case frame.TypeSettings:
 		if h.StreamID != 0 {
@@ -569,15 +567,14 @@ func (s *NativeSession) raiseInitialLimits(window uint64) {
 // dispatchStream handles the per-stream frame types, applying the receiver
 // rules from DESIGN.md. seg is released on every path that does not hand it
 // to a stream's receive queue.
-func (s *NativeSession) dispatchStream(h frame.Header, payload, seg []byte) error {
-	if seg != nil {
-		// Released unless onData takes ownership below.
-		defer func() {
-			if seg != nil {
-				pool.Put(seg)
-			}
-		}()
-	}
+func (s *NativeSession) dispatchStream(h frame.Header, payload []byte, seg pool.Buf) error {
+	// Released unless onData takes ownership below.
+	owned := true
+	defer func() {
+		if owned {
+			pool.Put(seg)
+		}
+	}()
 	if h.StreamID == 0 {
 		s.fatalProtocol(CodeProtocol, "stream frame on session ID 0")
 		return errSessionTerminated
@@ -653,9 +650,8 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload, seg []byte) erro
 
 	switch h.Type {
 	case frame.TypeData:
-		err := s.onData(st, h, payload, seg)
-		seg = nil // ownership passed to onData
-		return err
+		owned = false // ownership passes to onData
+		return s.onData(st, h, payload, seg)
 	case frame.TypeWindowUpdate:
 		limit, err := frame.ParseWindowUpdate(payload)
 		if err != nil {
@@ -691,10 +687,10 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload, seg []byte) erro
 
 // onData takes ownership of seg (the pooled buffer backing payload) and is
 // responsible for releasing it on every path where it is not queued.
-func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload, seg []byte) error {
+func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte, seg pool.Buf) error {
 	queued := false
 	defer func() {
-		if seg != nil && !queued {
+		if !queued {
 			pool.Put(seg)
 		}
 	}()

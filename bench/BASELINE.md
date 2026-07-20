@@ -5,6 +5,66 @@ yamux at its 16MB max window with keepalive off, mux at the same 16MB window.
 Comparing our default window against yamux's tuned one measures configuration,
 not implementation — see "A note on windows" below.
 
+## After the hardening pass (abuse limits, honest measurement, allocations)
+
+Loopback TCP, both sides tuned to a 16MB window, `-benchtime=2s`.
+
+| Benchmark | mux | yamux | ratio |
+|---|---|---|---|
+| Relay (proxy: stream→stream) | **5003 MB/s**, 2 allocs/op | 2151 MB/s, 6 allocs/op | **2.33× ahead** |
+| Small msgs, 64 streams | **365 ns/op**, **0 allocs/op** | 7414 ns/op, 2 allocs/op | **20.3× ahead** |
+| Bulk 64KB writes | **10720 MB/s**, 1 alloc/op | 6586 MB/s, 2 allocs/op | **1.63× ahead** |
+| Stream open/close | 9.9 µs, 19 allocs/op | 27.5 µs, 38 allocs/op | **2.78× ahead** |
+| Echo RTT 64B | 33.0 µs | 34.9 µs | 1.06× ahead |
+| **Open-loop p99** under 4 bulk streams | **2.12 ms** | 3.11 ms | **1.47× better tail** |
+| Open-loop p50 / max | 1.51 ms / 2.46 ms | 1.01 ms / 6.76 ms | worse p50, **2.7× better max** |
+
+Allocation targets are now essentially met on the steady-state data paths:
+**0 per operation for small messages, 1 for bulk, 2 for relay** (down from 1,
+3, and 6). Two real bugs were behind the rest:
+
+- `pool.Put` took the address of a local slice to satisfy `sync.Pool`'s
+  interface, which made the slice header escape on **every release** — 88% of
+  all allocations, in the code whose entire purpose is to avoid allocating.
+  The pool now hands out and takes back the pointer it owns.
+- `net.Buffers.WriteTo` **consumes** the slice it is given, advancing the
+  header as it writes. Passing the reusable iovec directly left it empty but
+  pointing at the end of its backing array, so every flush reallocated. It is
+  now written through a copy of the header.
+
+### Contention: measured, not assumed
+
+The design named the shared send mutex as the project's biggest performance
+risk and specified mitigations. Measuring first says which, if any, is
+warranted. Sweeping GOMAXPROCS with one writer per core:
+
+| GOMAXPROCS | ns/op | frames/flush |
+|---|---|---|
+| 1 | 1956 | 1.0 |
+| 2 | 411 | 7.8 |
+| **4** | **335** (peak) | 307 |
+| 8 | 404 | 796 |
+| 16 | 411 | 745 |
+| 32 | 425 | 768 |
+
+The knee is at four cores, after which throughput **degrades about 20% and
+then plateaus** rather than collapsing: batching rises as contention does, and
+the larger batches pay for the lock. A mutex profile at GOMAXPROCS=16
+attributes 84% of contention to `appendData` — the writer mutex, exactly as
+predicted, and *not* the session's stream map.
+
+That measurement settled two planned optimizations by ruling them out:
+
+- **Copy-on-write stream map**: not implemented. The mutex profile shows the
+  session map is not contended at all; replacing it would optimize something
+  no profile identifies.
+- **Per-read-batch wakeup coalescing**: not implemented. `notify` does not
+  appear in the top 30 nodes of a CPU profile on the receive-heavy path.
+
+Both remain correct ideas for a different bottleneck. Implementing them now
+would violate the rule the design sets for itself: no optimization without a
+measured delta.
+
 ## After M6 (autotune convergence, socket tuning, mixed-workload fairness)
 
 | Benchmark | mux | yamux | ratio |
