@@ -10,12 +10,16 @@ API may still move. See [DESIGN.md](DESIGN.md) for the architecture and
 [bench/BASELINE.md](bench/BASELINE.md) for measured numbers, including what
 does not yet win.
 
-Against tuned yamux on loopback TCP: **2.9× on relay** (the proxy workload),
-**17× on many-stream small messages**, **1.8× on single-stream bulk**, 2.3×
-on stream churn, and — on a mixed workload — **1.5× lower small-message
-latency while carrying 1.65× more bulk**. On a high-RTT path, autotuning
-reaches 2.8× yamux's shipped configuration but still trails a hand-tuned
-static window, an open problem documented in the baseline.
+Against tuned yamux on loopback TCP: **20× on many-stream small messages**
+(at zero allocations per operation), **2.3× on relay** (the proxy workload),
+**2.8× on stream churn**, **1.6× on single-stream bulk**, and a **1.5×
+better p99** under open-loop load. On a high-RTT path, autotuning reaches
+2.8× yamux's shipped configuration but still trails a hand-tuned static
+window — an open problem documented in the baseline.
+
+Peer input is rate-limited against the known multiplexer DoS shapes (ping
+floods, empty-frame floods, reset churn), and a panic in a library goroutine
+fails the session rather than the host process.
 
 - **Zero dependencies** outside the standard library, forever. Benchmarks and
   the QUIC adapter live in separate modules so `go get` stays clean.
