@@ -1,10 +1,10 @@
-package mux
+package portunus
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/giraffesyo/mux/internal/frame"
+	"github.com/giraffesyo/portunus/internal/frame"
 )
 
 // Config configures a session. The zero value (or nil) selects defaults.
@@ -190,22 +190,22 @@ func buildConfig(in *Config) (Config, error) {
 	}
 
 	if c.InitialWindow < frame.FloorInitialWindow {
-		return c, fmt.Errorf("mux: InitialWindow %d below protocol floor %d", c.InitialWindow, frame.FloorInitialWindow)
+		return c, fmt.Errorf("portunus: InitialWindow %d below protocol floor %d", c.InitialWindow, frame.FloorInitialWindow)
 	}
 	if c.MaxFrameSize < frame.FloorMaxFrameSize || c.MaxFrameSize > frame.MaxLength {
-		return c, fmt.Errorf("mux: MaxFrameSize %d outside [%d, %d]", c.MaxFrameSize, frame.FloorMaxFrameSize, frame.MaxLength)
+		return c, fmt.Errorf("portunus: MaxFrameSize %d outside [%d, %d]", c.MaxFrameSize, frame.FloorMaxFrameSize, frame.MaxLength)
 	}
 	if c.MaxIncomingStreams < 1 {
-		return c, fmt.Errorf("mux: MaxIncomingStreams %d < 1", c.MaxIncomingStreams)
+		return c, fmt.Errorf("portunus: MaxIncomingStreams %d < 1", c.MaxIncomingStreams)
 	}
 	if c.AcceptBacklog < 1 {
-		return c, fmt.Errorf("mux: AcceptBacklog %d < 1", c.AcceptBacklog)
+		return c, fmt.Errorf("portunus: AcceptBacklog %d < 1", c.AcceptBacklog)
 	}
 	// A batch must be able to hold at least one maximum-size frame, or a
 	// full-size write could never be admitted.
 	minBatch := int(c.MaxFrameSize) + frame.HeaderSize
 	if c.MaxBatchBytes < minBatch {
-		return c, fmt.Errorf("mux: MaxBatchBytes %d below one max frame (%d)", c.MaxBatchBytes, minBatch)
+		return c, fmt.Errorf("portunus: MaxBatchBytes %d below one max frame (%d)", c.MaxBatchBytes, minBatch)
 	}
 	// Each stream must be able to admit one full frame, or a max-size write
 	// could never make progress.
@@ -216,7 +216,7 @@ func buildConfig(in *Config) (Config, error) {
 	// healthy peer dead between probes — the incoherent-defaults bug that
 	// has bitten several tunnel projects.
 	if c.KeepaliveInterval > 0 && c.KeepaliveTimeout > 0 && c.KeepaliveTimeout <= c.KeepaliveInterval {
-		return c, fmt.Errorf("mux: KeepaliveTimeout %v must exceed KeepaliveInterval %v",
+		return c, fmt.Errorf("portunus: KeepaliveTimeout %v must exceed KeepaliveInterval %v",
 			c.KeepaliveTimeout, c.KeepaliveInterval)
 	}
 	return c, nil

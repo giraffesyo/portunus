@@ -1,4 +1,4 @@
-// Package bench compares mux against tuned baselines. It is a separate
+// Package bench compares portunus against tuned baselines. It is a separate
 // module so the core stays dependency-free.
 //
 // Baselines are configured at their best, not their defaults: comparing
@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 	"github.com/hashicorp/yamux"
 )
 
@@ -57,18 +57,18 @@ func tcpPair(tb testing.TB) (net.Conn, net.Conn) {
 // window, so the comparison measures the implementations rather than two
 // different flow-control budgets. (Until BDP autotune lands in M5, a static
 // window is all either side has.)
-func muxConfig() *mux.Config {
-	return &mux.Config{InitialWindow: 16 << 20}
+func muxConfig() *portunus.Config {
+	return &portunus.Config{InitialWindow: 16 << 20}
 }
 
 // muxPair builds a mux client/server session pair.
-func muxPair(tb testing.TB) (*mux.NativeSession, *mux.NativeSession) {
+func muxPair(tb testing.TB) (*portunus.NativeSession, *portunus.NativeSession) {
 	a, b := tcpPair(tb)
-	cs, err := mux.Client(a, muxConfig())
+	cs, err := portunus.Client(a, muxConfig())
 	if err != nil {
 		tb.Fatal(err)
 	}
-	ss, err := mux.Server(b, muxConfig())
+	ss, err := portunus.Server(b, muxConfig())
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func BenchmarkSmallMsgsMux(b *testing.B) {
 		}
 	}()
 
-	streams := make([]mux.Stream, parStreams)
+	streams := make([]portunus.Stream, parStreams)
 	for i := range streams {
 		st, err := cs.OpenStream(ctx)
 		if err != nil {
@@ -322,7 +322,7 @@ func BenchmarkStreamChurnMux(b *testing.B) {
 			if err != nil {
 				return
 			}
-			go func(st mux.Stream) { io.Copy(io.Discard, st); st.Close() }(st)
+			go func(st portunus.Stream) { io.Copy(io.Discard, st); st.Close() }(st)
 		}
 	}()
 

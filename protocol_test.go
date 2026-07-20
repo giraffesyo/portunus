@@ -1,4 +1,4 @@
-package mux
+package portunus
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux/internal/frame"
+	"github.com/giraffesyo/portunus/internal/frame"
 )
 
 // rawPeer drives the wire directly against a real session, so receiver rules

@@ -1,9 +1,9 @@
-module github.com/giraffesyo/mux/adapters/quic
+module github.com/giraffesyo/portunus/adapters/quic
 
 go 1.26.1
 
 require (
-	github.com/giraffesyo/mux v0.0.0
+	github.com/giraffesyo/portunus v0.0.0
 	github.com/quic-go/quic-go v0.60.0
 )
 
@@ -13,4 +13,4 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 )
 
-replace github.com/giraffesyo/mux => ../../
+replace github.com/giraffesyo/portunus => ../../

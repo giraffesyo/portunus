@@ -1,6 +1,6 @@
 //go:build darwin
 
-package mux
+package portunus
 
 import "syscall"
 

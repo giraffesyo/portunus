@@ -1,8 +1,8 @@
-// Package quic adapts a QUIC connection to the mux Session and Stream
-// interfaces, so transport-agnostic code can hold either a native mux session
+// Package quic adapts a QUIC connection to the portunus Session and Stream
+// interfaces, so transport-agnostic code can hold either a native portunus session
 // over TCP or a QUIC connection without knowing which.
 //
-// It lives in its own module: the mux core has no dependencies outside the
+// It lives in its own module: the portunus core has no dependencies outside the
 // standard library and never will, so depending on quic-go is opt-in.
 //
 // Use QUIC when you need what a userspace multiplexer over TCP cannot give
@@ -22,11 +22,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 	quicgo "github.com/quic-go/quic-go"
 )
 
-// Session wraps a QUIC connection. It satisfies mux.Session.
+// Session wraps a QUIC connection. It satisfies portunus.Session.
 type Session struct {
 	conn *quicgo.Conn
 
@@ -35,7 +35,7 @@ type Session struct {
 	live atomic.Int64
 }
 
-// Stream wraps a QUIC stream. It satisfies mux.Stream, and therefore
+// Stream wraps a QUIC stream. It satisfies portunus.Stream, and therefore
 // net.Conn: QUIC streams have no addresses of their own, so LocalAddr and
 // RemoteAddr report the underlying connection's.
 type Stream struct {
@@ -47,8 +47,8 @@ type Stream struct {
 }
 
 var (
-	_ mux.Session = (*Session)(nil)
-	_ mux.Stream  = (*Stream)(nil)
+	_ portunus.Session = (*Session)(nil)
+	_ portunus.Stream  = (*Stream)(nil)
 )
 
 // Wrap adapts an established QUIC connection. The caller retains
@@ -97,7 +97,7 @@ func (s *Session) Conn() *quicgo.Conn { return s.conn }
 
 // OpenStream opens a bidirectional stream, blocking until the peer's stream
 // limit allows it or ctx is done.
-func (s *Session) OpenStream(ctx context.Context) (mux.Stream, error) {
+func (s *Session) OpenStream(ctx context.Context) (portunus.Stream, error) {
 	st, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, translate(err)
@@ -107,7 +107,7 @@ func (s *Session) OpenStream(ctx context.Context) (mux.Stream, error) {
 }
 
 // AcceptStream returns the next stream opened by the peer.
-func (s *Session) AcceptStream(ctx context.Context) (mux.Stream, error) {
+func (s *Session) AcceptStream(ctx context.Context) (portunus.Stream, error) {
 	st, err := s.conn.AcceptStream(ctx)
 	if err != nil {
 		return nil, translate(err)
@@ -180,7 +180,7 @@ func (s *Stream) CloseWrite() error { return translate(s.st.Close()) }
 // matching the native session's documented semantics.
 func (s *Stream) Close() error {
 	err := s.st.Close()
-	s.st.CancelRead(quicgo.StreamErrorCode(mux.CodeCanceled))
+	s.st.CancelRead(quicgo.StreamErrorCode(portunus.CodeCanceled))
 	// Counted once however often Close is called, so Shutdown's drain
 	// cannot be driven negative by a caller that closes twice.
 	s.closeOne.Do(func() {
@@ -198,7 +198,7 @@ func (s *Stream) CancelRead(code uint64) {
 }
 
 // CancelWrite aborts the send side (RESET_STREAM); the peer's Read fails
-// with a *mux.StreamError carrying code.
+// with a *portunus.StreamError carrying code.
 func (s *Stream) CancelWrite(code uint64) {
 	s.st.CancelWrite(quicgo.StreamErrorCode(code))
 }
@@ -225,11 +225,11 @@ func translate(err error) error {
 	}
 	var se *quicgo.StreamError
 	if errors.As(err, &se) {
-		return &mux.StreamError{Code: uint64(se.ErrorCode), Remote: se.Remote}
+		return &portunus.StreamError{Code: uint64(se.ErrorCode), Remote: se.Remote}
 	}
 	var ae *quicgo.ApplicationError
 	if errors.As(err, &ae) {
-		return &mux.SessionError{
+		return &portunus.SessionError{
 			Code:   uint64(ae.ErrorCode),
 			Reason: ae.ErrorMessage,
 			Remote: ae.Remote,
@@ -237,7 +237,7 @@ func translate(err error) error {
 	}
 	var te *quicgo.TransportError
 	if errors.As(err, &te) {
-		return &mux.SessionError{
+		return &portunus.SessionError{
 			Code:   uint64(te.ErrorCode),
 			Reason: te.ErrorMessage,
 			Remote: te.Remote,

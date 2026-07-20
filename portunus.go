@@ -15,7 +15,7 @@
 // The core has no dependencies outside the standard library. The Session and
 // Stream interfaces are also satisfied by the QUIC adapter in
 // adapters/quic, so transport-agnostic code can hold either.
-package mux
+package portunus
 
 import (
 	"context"

@@ -1,17 +1,17 @@
-package mux_test
+package portunus_test
 
 import (
 	"net"
 	"testing"
 
-	"github.com/giraffesyo/mux"
-	"github.com/giraffesyo/mux/conformance"
+	"github.com/giraffesyo/portunus"
+	"github.com/giraffesyo/portunus/conformance"
 )
 
 // The native TCP session must satisfy the same shared semantics as the QUIC
 // adapter; adapters/quic runs this identical suite against QUIC.
 func TestConformanceNative(t *testing.T) {
-	conformance.Run(t, func(t *testing.T) (mux.Session, mux.Session) {
+	conformance.Run(t, func(t *testing.T) (portunus.Session, portunus.Session) {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -36,11 +36,11 @@ func TestConformanceNative(t *testing.T) {
 			t.Fatal(r.err)
 		}
 
-		client, err := mux.Client(cc, nil)
+		client, err := portunus.Client(cc, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		server, err := mux.Server(r.c, nil)
+		server, err := portunus.Server(r.c, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

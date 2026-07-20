@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux"
-	quicadapter "github.com/giraffesyo/mux/adapters/quic"
-	"github.com/giraffesyo/mux/conformance"
+	"github.com/giraffesyo/portunus"
+	quicadapter "github.com/giraffesyo/portunus/adapters/quic"
+	"github.com/giraffesyo/portunus/conformance"
 	quicgo "github.com/quic-go/quic-go"
 )
 
@@ -28,7 +28,7 @@ func TestConformanceQUIC(t *testing.T) {
 	conformance.Run(t, quicPair)
 }
 
-func quicPair(t *testing.T) (mux.Session, mux.Session) {
+func quicPair(t *testing.T) (portunus.Session, portunus.Session) {
 	t.Helper()
 	serverTLS, clientTLS := testTLS(t)
 
@@ -136,7 +136,7 @@ func TestShutdownDrainsLiveStreams(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(st mux.Stream) { io.Copy(st, st); st.CloseWrite() }(st)
+			go func(st portunus.Stream) { io.Copy(st, st); st.CloseWrite() }(st)
 		}
 	}()
 

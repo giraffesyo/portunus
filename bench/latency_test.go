@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 	"github.com/hashicorp/yamux"
 )
 
@@ -208,7 +208,7 @@ func BenchmarkOpenLoopYamux(b *testing.B) {
 	res.report(b)
 }
 
-func startMuxBulk(b *testing.B, cs *mux.NativeSession, ctx context.Context) chan struct{} {
+func startMuxBulk(b *testing.B, cs *portunus.NativeSession, ctx context.Context) chan struct{} {
 	b.Helper()
 	stop := make(chan struct{})
 	for range bulkStreams {

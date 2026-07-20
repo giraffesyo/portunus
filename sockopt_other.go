@@ -1,6 +1,6 @@
 //go:build !linux && !darwin
 
-package mux
+package portunus
 
 import "net"
 

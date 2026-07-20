@@ -1,4 +1,4 @@
-# mux — Design Document
+# portunus — Design Document
 
 A stream multiplexer for Go that outperforms yamux while remaining idiomatic,
 cleanly separated, and dependency-free (standard library only in the core module).
@@ -579,7 +579,7 @@ Semantics stolen from QUIC deliberately, so the quic-go adapter maps 1:1:
 ## Public API
 
 ```go
-package mux // github.com/giraffesyo/mux (module path TBD until remote exists)
+package mux // github.com/giraffesyo/portunus (module path TBD until remote exists)
 
 // Transport-agnostic; satisfied by the native session and the QUIC adapter.
 type Session interface {
@@ -648,7 +648,7 @@ func Server(conn net.Conn, cfg *Config) (*NativeSession, error)
 ## Module layout
 
 ```
-github.com/giraffesyo/mux            core module, zero deps
+github.com/giraffesyo/portunus            core module, zero deps
   mux.go session.go stream.go config.go errors.go
   internal/frame/                    encode/decode + fuzz targets
   internal/pool/                     size-classed segment pools
@@ -658,7 +658,7 @@ github.com/giraffesyo/mux            core module, zero deps
 ```
 
 The root `go.mod` never gains a dependency; adapters and benchmarks are
-isolated modules so `go get github.com/giraffesyo/mux` stays pristine.
+isolated modules so `go get github.com/giraffesyo/portunus` stays pristine.
 
 ## Toolchain and observability
 

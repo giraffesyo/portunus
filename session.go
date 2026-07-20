@@ -1,4 +1,4 @@
-package mux
+package portunus
 
 import (
 	"bufio"
@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/giraffesyo/mux/internal/frame"
-	"github.com/giraffesyo/mux/internal/pool"
+	"github.com/giraffesyo/portunus/internal/frame"
+	"github.com/giraffesyo/portunus/internal/pool"
 )
 
 // NativeSession multiplexes streams over a reliable byte-stream carrier

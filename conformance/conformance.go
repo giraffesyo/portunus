@@ -1,10 +1,10 @@
-// Package conformance is a shared test suite for the mux Session and Stream
+// Package conformance is a shared test suite for the portunus Session and Stream
 // interfaces. It runs unchanged against the native TCP session and against
 // the QUIC adapter, which is the only way to know the two really are
 // interchangeable — an interface both types satisfy at compile time can still
 // behave differently at every semantic that matters.
 //
-// It imports only the standard library and mux, so the core module stays
+// It imports only the standard library and portunus, so the core module stays
 // dependency-free.
 package conformance
 
@@ -19,12 +19,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 )
 
 // Pair returns two connected sessions and is called once per subtest. The
 // implementation is responsible for cleaning up when the test ends.
-type Pair func(t *testing.T) (client, server mux.Session)
+type Pair func(t *testing.T) (client, server portunus.Session)
 
 // Run executes the suite against one implementation.
 func Run(t *testing.T, newPair Pair) {
@@ -58,13 +58,13 @@ func ctx(t *testing.T) context.Context {
 }
 
 // serveEcho accepts streams and echoes them until the session ends.
-func serveEcho(c context.Context, s mux.Session) {
+func serveEcho(c context.Context, s portunus.Session) {
 	for {
 		st, err := s.AcceptStream(c)
 		if err != nil {
 			return
 		}
-		go func(st mux.Stream) {
+		go func(st portunus.Stream) {
 			io.Copy(st, st)
 			st.CloseWrite()
 		}(st)
@@ -73,7 +73,7 @@ func serveEcho(c context.Context, s mux.Session) {
 
 // open starts a stream and pushes a byte, so implementations that announce a
 // stream lazily have actually done so before the peer is expected to see it.
-func open(t *testing.T, c context.Context, s mux.Session) mux.Stream {
+func open(t *testing.T, c context.Context, s portunus.Session) portunus.Stream {
 	t.Helper()
 	st, err := s.OpenStream(c)
 	if err != nil {
@@ -85,7 +85,7 @@ func open(t *testing.T, c context.Context, s mux.Session) mux.Stream {
 	return st
 }
 
-func accept(t *testing.T, c context.Context, s mux.Session) mux.Stream {
+func accept(t *testing.T, c context.Context, s portunus.Session) portunus.Stream {
 	t.Helper()
 	st, err := s.AcceptStream(c)
 	if err != nil {
@@ -189,13 +189,13 @@ func testCancelWrite(t *testing.T, newPair Pair) {
 	cs := open(t, c, client)
 	ss := accept(t, c, server)
 
-	const code = mux.CodeApp + 7
+	const code = portunus.CodeApp + 7
 	cs.CancelWrite(code)
 
 	_, err := io.ReadAll(ss)
-	var se *mux.StreamError
+	var se *portunus.StreamError
 	if !errors.As(err, &se) {
-		t.Fatalf("peer read after CancelWrite: got %v, want *mux.StreamError", err)
+		t.Fatalf("peer read after CancelWrite: got %v, want *portunus.StreamError", err)
 	}
 	if se.Code != code {
 		t.Errorf("error code = %d, want %d", se.Code, code)
@@ -212,7 +212,7 @@ func testCancelRead(t *testing.T, newPair Pair) {
 	cs := open(t, c, client)
 	ss := accept(t, c, server)
 
-	const code = mux.CodeApp + 3
+	const code = portunus.CodeApp + 3
 	cs.CancelRead(code)
 
 	// The peer's writes must fail once the cancel lands. Keep writing until
@@ -224,9 +224,9 @@ func testCancelRead(t *testing.T, newPair Pair) {
 			break
 		}
 	}
-	var se *mux.StreamError
+	var se *portunus.StreamError
 	if !errors.As(err, &se) {
-		t.Fatalf("peer write after CancelRead: got %v, want *mux.StreamError", err)
+		t.Fatalf("peer write after CancelRead: got %v, want *portunus.StreamError", err)
 	}
 	if se.Code != code {
 		t.Errorf("error code = %d, want %d", se.Code, code)

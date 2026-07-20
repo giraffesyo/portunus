@@ -1,4 +1,4 @@
-package mux
+package portunus
 
 import (
 	"errors"
@@ -26,23 +26,23 @@ var (
 	// close. It deliberately does not satisfy net.Error, so an accept loop
 	// (e.g. http.Server on a session used as a net.Listener) terminates
 	// instead of hot-looping on a "temporary" error.
-	ErrSessionClosed = errors.New("mux: session closed")
+	ErrSessionClosed = errors.New("portunus: session closed")
 
 	// ErrStreamClosed is returned for operations on a locally closed stream.
-	ErrStreamClosed = errors.New("mux: stream closed")
+	ErrStreamClosed = errors.New("portunus: stream closed")
 
 	// ErrGoAway is a retriable error: the session is draining (GOAWAY seen
 	// or Shutdown started) and cannot carry new streams. Callers should
 	// retry on a fresh session.
-	ErrGoAway = errors.New("mux: session draining")
+	ErrGoAway = errors.New("portunus: session draining")
 
 	// ErrStreamsExhausted is a retriable error: the session's stream ID
 	// space is nearly exhausted. Callers should rotate to a fresh session.
-	ErrStreamsExhausted = errors.New("mux: stream IDs exhausted")
+	ErrStreamsExhausted = errors.New("portunus: stream IDs exhausted")
 
 	// ErrRefused reports that the peer refused a stream (accept overflow or
 	// draining). Retriable, typically on a different or later session.
-	ErrRefused = errors.New("mux: stream refused by peer")
+	ErrRefused = errors.New("portunus: stream refused by peer")
 )
 
 // StreamError is a stream reset: either the peer aborted (Remote true, via
@@ -58,7 +58,7 @@ func (e *StreamError) Error() string {
 	if e.Remote {
 		side = "remote"
 	}
-	return fmt.Sprintf("mux: stream reset (%s, code %d)", side, e.Code)
+	return fmt.Sprintf("portunus: stream reset (%s, code %d)", side, e.Code)
 }
 
 // Is makes REFUSED resets match ErrRefused via errors.Is.
@@ -83,7 +83,7 @@ func (e *SessionError) Error() string {
 		side = "remote"
 	}
 	if e.Reason == "" {
-		return fmt.Sprintf("mux: session error (%s, code %d)", side, e.Code)
+		return fmt.Sprintf("portunus: session error (%s, code %d)", side, e.Code)
 	}
-	return fmt.Sprintf("mux: session error (%s, code %d): %s", side, e.Code, e.Reason)
+	return fmt.Sprintf("portunus: session error (%s, code %d): %s", side, e.Code, e.Reason)
 }

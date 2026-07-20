@@ -1,4 +1,4 @@
-package mux
+package portunus
 
 import (
 	"net"
@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/giraffesyo/mux/internal/frame"
+	"github.com/giraffesyo/portunus/internal/frame"
 )
 
 // The send path is group commit: writers append frames to a shared pending

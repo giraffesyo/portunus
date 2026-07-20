@@ -1,4 +1,4 @@
-# mux
+# portunus
 
 A stream multiplexer for Go: many logical streams over one reliable
 byte-stream carrier (TCP, TLS, a Unix socket, an SSH channel — anything

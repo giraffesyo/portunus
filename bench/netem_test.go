@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 	"github.com/hashicorp/yamux"
 )
 
@@ -45,7 +45,7 @@ const netemBytes = 8 << 20
 func BenchmarkNetemMux(b *testing.B) {
 	requireNetem(b)
 	a, z := tcpPair(b)
-	cfg := &mux.Config{
+	cfg := &portunus.Config{
 		InitialWindow:     64 << 10,
 		MaxWindow:         64 << 20,
 		KeepaliveInterval: 100 * time.Millisecond,
@@ -54,15 +54,15 @@ func BenchmarkNetemMux(b *testing.B) {
 	ctx := context.Background()
 
 	type res struct {
-		s   *mux.NativeSession
+		s   *portunus.NativeSession
 		err error
 	}
 	ch := make(chan res, 1)
 	go func() {
-		s, err := mux.Server(z, cfg)
+		s, err := portunus.Server(z, cfg)
 		ch <- res{s, err}
 	}()
-	cs, err := mux.Client(a, cfg)
+	cs, err := portunus.Client(a, cfg)
 	if err != nil {
 		b.Fatal(err)
 	}

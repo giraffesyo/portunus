@@ -1,4 +1,4 @@
-package mux_test
+package portunus_test
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 )
 
 // Multiplexing a request and response over one carrier.
@@ -19,7 +19,7 @@ func Example() {
 
 	// The server side, echoing whatever each stream sends.
 	go func() {
-		sess, err := mux.Server(peer, nil)
+		sess, err := portunus.Server(peer, nil)
 		if err != nil {
 			log.Print(err)
 			return
@@ -30,14 +30,14 @@ func Example() {
 			if err != nil {
 				return
 			}
-			go func(st mux.Stream) {
+			go func(st portunus.Stream) {
 				io.Copy(st, st)
 				st.CloseWrite()
 			}(st)
 		}
 	}()
 
-	sess, err := mux.Client(carrier, nil)
+	sess, err := portunus.Client(carrier, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func ExampleSession_asListener() {
 	carrier, peer := net.Pipe()
 
 	go func() {
-		sess, err := mux.Client(carrier, nil)
+		sess, err := portunus.Client(carrier, nil)
 		if err != nil {
 			return
 		}
@@ -82,7 +82,7 @@ func ExampleSession_asListener() {
 		io.Copy(io.Discard, st)
 	}()
 
-	sess, err := mux.Server(peer, nil)
+	sess, err := portunus.Server(peer, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -106,13 +106,13 @@ func ExampleSession_asListener() {
 func ExampleStream_CancelWrite() {
 	carrier, peer := net.Pipe()
 
-	const codeQuotaExceeded = mux.CodeApp + 42
+	const codeQuotaExceeded = portunus.CodeApp + 42
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sess, err := mux.Server(peer, nil)
+		sess, err := portunus.Server(peer, nil)
 		if err != nil {
 			return
 		}
@@ -123,13 +123,13 @@ func ExampleStream_CancelWrite() {
 		}
 		_, err = io.ReadAll(st)
 
-		var se *mux.StreamError
+		var se *portunus.StreamError
 		if errors.As(err, &se) {
-			fmt.Printf("peer aborted with code %d (remote=%v)\n", se.Code-mux.CodeApp, se.Remote)
+			fmt.Printf("peer aborted with code %d (remote=%v)\n", se.Code-portunus.CodeApp, se.Remote)
 		}
 	}()
 
-	sess, err := mux.Client(carrier, nil)
+	sess, err := portunus.Client(carrier, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func ExampleSession_Shutdown() {
 	carrier, peer := net.Pipe()
 
 	go func() {
-		sess, err := mux.Server(peer, nil)
+		sess, err := portunus.Server(peer, nil)
 		if err != nil {
 			return
 		}
@@ -161,11 +161,11 @@ func ExampleSession_Shutdown() {
 			if err != nil {
 				return
 			}
-			go func(st mux.Stream) { io.Copy(st, st); st.Close() }(st)
+			go func(st portunus.Stream) { io.Copy(st, st); st.Close() }(st)
 		}
 	}()
 
-	sess, err := mux.Client(carrier, nil)
+	sess, err := portunus.Client(carrier, nil)
 	if err != nil {
 		log.Fatal(err)
 	}

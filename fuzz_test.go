@@ -1,4 +1,4 @@
-package mux
+package portunus
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux/internal/frame"
+	"github.com/giraffesyo/portunus/internal/frame"
 )
 
 // FuzzWireInput feeds arbitrary bytes to a live session as if they came from

@@ -1,4 +1,4 @@
-package mux
+package portunus
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux/internal/frame"
+	"github.com/giraffesyo/portunus/internal/frame"
 )
 
 // A PING flood must be cut off rather than answered indefinitely: every

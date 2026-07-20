@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 	"github.com/hashicorp/yamux"
 )
 
@@ -97,7 +97,7 @@ func laggyConns(delay time.Duration) (net.Conn, net.Conn) {
 // starting from the 64KB protocol floor: every byte of window is earned.
 func BenchmarkWANMux(b *testing.B) {
 	a, z := laggyConns(wanOneWay)
-	cfg := &mux.Config{
+	cfg := &portunus.Config{
 		InitialWindow:     64 << 10,
 		MaxWindow:         32 << 20,
 		KeepaliveInterval: 50 * time.Millisecond,
@@ -106,15 +106,15 @@ func BenchmarkWANMux(b *testing.B) {
 	ctx := context.Background()
 
 	type res struct {
-		s   *mux.NativeSession
+		s   *portunus.NativeSession
 		err error
 	}
 	ch := make(chan res, 1)
 	go func() {
-		s, err := mux.Server(z, cfg)
+		s, err := portunus.Server(z, cfg)
 		ch <- res{s, err}
 	}()
-	cs, err := mux.Client(a, cfg)
+	cs, err := portunus.Client(a, cfg)
 	if err != nil {
 		b.Fatal(err)
 	}

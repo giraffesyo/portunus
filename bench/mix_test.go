@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/giraffesyo/mux"
+	"github.com/giraffesyo/portunus"
 	"github.com/hashicorp/yamux"
 )
 
@@ -23,12 +23,12 @@ import (
 
 func BenchmarkMixedWorkloadMux(b *testing.B) {
 	a, z := tcpPair(b)
-	cfg := &mux.Config{InitialWindow: 16 << 20}
-	cs, err := mux.Client(a, cfg)
+	cfg := &portunus.Config{InitialWindow: 16 << 20}
+	cs, err := portunus.Client(a, cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
-	ss, err := mux.Server(z, cfg)
+	ss, err := portunus.Server(z, cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
