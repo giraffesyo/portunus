@@ -4,9 +4,9 @@ A stream multiplexer for Go: many logical streams over one reliable
 byte-stream carrier (TCP, TLS, a Unix socket, an SSH channel — anything
 satisfying `net.Conn`).
 
-**Status: in development, not yet released.** The protocol, the core, and the
-performance machinery are built and tested; the QUIC adapter and hardening
-pass are not. See [DESIGN.md](DESIGN.md) for the architecture and
+**Status: in development, not yet released.** The protocol, the core, the
+performance machinery, and the QUIC adapter are built and tested; the
+hardening pass is not. See [DESIGN.md](DESIGN.md) for the architecture and
 [bench/BASELINE.md](bench/BASELINE.md) for measured numbers, including what
 does not yet win.
 
@@ -24,6 +24,10 @@ static window, an open problem documented in the baseline.
   cancellation carrying an application error code.
 - **Zero-syscall stream open**: `OpenStream` is purely local; a stream
   announces itself on its first frame.
+- **One API over two transports**: the same `Session` and `Stream` interfaces
+  are satisfied by the native TCP session and by the QUIC adapter, and a
+  shared conformance suite runs against both, so they behave the same and not
+  merely compile the same.
 
 ```go
 sess, err := mux.Client(conn, nil)
@@ -85,7 +89,7 @@ benchmark against tuned (not default) baselines.
 | M4 | Receive fast paths: segment pools, zero-copy relay | done |
 | M5 | BDP-autotuned flow control, keepalive | done |
 | M6 | Performance targets, socket tuning, mixed-workload fairness | done |
-| M7 | QUIC adapter (`adapters/quic`) | planned |
+| M7 | QUIC adapter (`adapters/quic`) + shared conformance suite | done |
 | M8 | Fuzzing, soak, hardening, docs | planned |
 
 ## Development
