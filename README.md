@@ -11,10 +11,11 @@ pass are not. See [DESIGN.md](DESIGN.md) for the architecture and
 does not yet win.
 
 Against tuned yamux on loopback TCP: **2.9× on relay** (the proxy workload),
-**20× on many-stream small messages**, **1.8× on single-stream bulk**, 2.3×
-on stream churn, and parity on echo latency. On a high-RTT path, autotuning
-beats yamux's default configuration but not a hand-tuned static window — an
-open problem documented in the baseline.
+**17× on many-stream small messages**, **1.8× on single-stream bulk**, 2.3×
+on stream churn, and — on a mixed workload — **1.5× lower small-message
+latency while carrying 1.65× more bulk**. On a high-RTT path, autotuning
+reaches 2.8× yamux's shipped configuration but still trails a hand-tuned
+static window, an open problem documented in the baseline.
 
 - **Zero dependencies** outside the standard library, forever. Benchmarks and
   the QUIC adapter live in separate modules so `go get` stays clean.
@@ -83,7 +84,7 @@ benchmark against tuned (not default) baselines.
 | M3 | Group commit: batched writev send path | done |
 | M4 | Receive fast paths: segment pools, zero-copy relay | done |
 | M5 | BDP-autotuned flow control, keepalive | done |
-| M6 | Hit the performance targets (WAN autotune, tail latency) | next |
+| M6 | Performance targets, socket tuning, mixed-workload fairness | done |
 | M7 | QUIC adapter (`adapters/quic`) | planned |
 | M8 | Fuzzing, soak, hardening, docs | planned |
 

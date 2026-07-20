@@ -36,6 +36,11 @@ const (
 	// tlsRecordSize is crypto/tls's maximum plaintext record. Coalesced
 	// writes are chunked to it so no copy exceeds what one record carries.
 	tlsRecordSize = 16 << 10
+
+	// smallWriteReserve is batch space kept clear of bulk writes so small
+	// messages always have somewhere to land. It bounds how long a small
+	// write can be held out of the batch currently being assembled.
+	smallWriteReserve = 64 << 10
 )
 
 // chunk is one entry in a pending batch: either a reference to caller memory
@@ -300,7 +305,18 @@ func (w *writer) admissionBlockedLocked(st *NativeStream, total int) bool {
 	if w.pending == 0 {
 		return false
 	}
-	if w.pending+total > w.s.cfg.MaxBatchBytes {
+	// Bulk writes must leave headroom that only small writes may use, so a
+	// latency-sensitive message can always join the batch being assembled
+	// instead of queueing behind a batch's worth of bulk data. Without the
+	// reservation, small writers lose the admission race to a handful of
+	// saturating bulk writers until the runtime's mutex starvation mode
+	// forces a handoff — which showed up as a millisecond of added tail
+	// latency, an order of magnitude worse than the batch itself.
+	cap := w.s.cfg.MaxBatchBytes
+	if total > zeroCopyThreshold {
+		cap -= smallWriteReserve
+	}
+	if w.pending+total > cap {
 		return true
 	}
 	return st.batchSeq == w.seq+1 && st.batchBytes+total > w.s.cfg.PerStreamBatchBytes

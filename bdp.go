@@ -32,7 +32,8 @@ type bdpEstimator struct {
 	bytesAt    uint64 // recvTotal when the probe reached the carrier
 	probeFrom  uint64 // recvTotal when the probe was enqueued (pacing only)
 	stallsAt   uint64 // stall count when the probe reached the carrier
-	sampleWait bool   // enqueued, not yet stamped by the flusher
+	reservedAt time.Time
+	sampleWait bool // enqueued, not yet stamped by the flusher
 
 	minRTT time.Duration
 	bwMax  float64 // bytes per second, best ever observed
@@ -51,9 +52,18 @@ func newBDPEstimator(initial, maxWindow uint64) *bdpEstimator {
 
 // shouldProbe reports whether enough data has arrived to justify a new
 // sample, and reserves the probe slot if so.
-func (b *bdpEstimator) shouldProbe(recvTotal uint64, opaque uint64) bool {
+func (b *bdpEstimator) shouldProbe(recvTotal uint64, opaque uint64, now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// A probe that never completes must not wedge the estimator. Anything
+	// outstanding well past a plausible round trip is abandoned so a new
+	// sample can start; without this, one lost probe disables autotuning
+	// for the life of the session — observed as a window frozen at its
+	// initial size on roughly half of otherwise identical runs.
+	if b.probing && now.Sub(b.reservedAt) > b.probeTimeout() {
+		b.probing = false
+		b.sampleWait = false
+	}
 	// The threshold scales with the current estimate, so probing settles at
 	// roughly one sample per round trip once the window is sized. A fixed
 	// 64KB threshold means a probe per frame at 64KB frames, and each probe
@@ -62,6 +72,7 @@ func (b *bdpEstimator) shouldProbe(recvTotal uint64, opaque uint64) bool {
 	if b.probing || recvTotal < b.probeFrom+need {
 		return false
 	}
+	b.reservedAt = now
 	b.probing = true
 	b.sampleWait = true
 	b.opaque = opaque
@@ -93,10 +104,16 @@ func (b *bdpEstimator) markSent(now time.Time, recvTotal, stalls uint64) {
 func (b *bdpEstimator) onACK(opaque, recvTotal, stalls uint64, now time.Time) uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.probing || opaque != b.opaque || b.sampleWait {
-		return 0 // not our probe, or it never got stamped
+	if !b.probing || opaque != b.opaque {
+		return 0 // not our probe (a plain keepalive PING, or a straggler)
 	}
+	// Ours: release the slot on every path from here, so an unusable
+	// sample costs one round trip rather than all future ones.
 	b.probing = false
+	if b.sampleWait {
+		b.sampleWait = false
+		return 0 // never reached the carrier: no honest timestamp
+	}
 
 	rtt := now.Sub(b.sentAt)
 	if rtt <= 0 {
@@ -112,18 +129,28 @@ func (b *bdpEstimator) onACK(opaque, recvTotal, stalls uint64, now time.Time) ui
 		b.bwMax = bw
 	}
 
-	// Grow when the peer actually ran out of credit during this probe.
+	// Grow on either sign that the window is the binding constraint:
 	//
-	// This is measured directly — the receiver knows when a sender has
-	// consumed every byte it was granted — rather than inferred from the
-	// arrival rate, and that distinction is what makes autotuning work at
-	// all. Rate-based tests (sample vs. estimate, or matching a bandwidth
-	// record) are circular here: a window too small to fill the pipe makes
-	// the sender stall waiting for credit, which lowers the arrival rate,
-	// which fails the test, which keeps the window small. Measured against
-	// a 200ms path, that circularity pinned the window at its initial size
-	// indefinitely; a stall signal escapes it in a few round trips.
-	if stalls == b.stallsAt {
+	//   - the peer ran out of credit during this probe (measured directly:
+	//     the receiver knows when a sender has consumed what it was
+	//     granted), or
+	//   - a meaningful fraction of the window arrived within one round
+	//     trip, so a larger window would plausibly carry more.
+	//
+	// Both are needed. A pure stall signal under-triggers: credit is
+	// refreshed at half-window, so a sender in the resulting sawtooth
+	// rarely hits exactly zero and growth halts around 60% utilization —
+	// measured, with the window frozen while throughput sat well below
+	// what the path allowed. A pure rate signal is circular in the other
+	// direction: a window too small to fill the pipe depresses the very
+	// rate the test reads, so the window never grows at all.
+	//
+	// The utilization threshold is deliberately low (40%) because that
+	// sawtooth caps steady-state utilization well under 100%; requiring
+	// two thirds stalls the climb at the first sawtooth.
+	stalled := stalls != b.stallsAt
+	utilized := sample*5 >= b.bdp*2
+	if !stalled && !utilized {
 		return 0
 	}
 	// Unless the path is visibly congested — then the window is not what is
@@ -139,6 +166,15 @@ func (b *bdpEstimator) onACK(opaque, recvTotal, stalls uint64, now time.Time) ui
 	}
 	b.bdp = target
 	return target
+}
+
+// probeTimeout bounds how long a probe may stay outstanding: several round
+// trips once one is known, and a fixed few seconds before that.
+func (b *bdpEstimator) probeTimeout() time.Duration {
+	if b.minRTT > 0 {
+		return max(8*b.minRTT, 250*time.Millisecond)
+	}
+	return 5 * time.Second
 }
 
 // rtt returns the min-filtered round-trip estimate (0 before any sample).

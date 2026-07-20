@@ -113,6 +113,10 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}
+	if c.NotSentLowat > 0 {
+		// Best effort: an unsupported kernel just keeps deeper queues.
+		_ = applyNotSentLowat(conn, c.NotSentLowat)
+	}
 
 	if err := s.sendSettings(); err != nil {
 		return nil, err
@@ -161,7 +165,7 @@ func (s *NativeSession) sendProbe() {
 	opaque := s.nextProbe.Add(1)
 	var buf [frame.PingLen]byte
 	payload := frame.AppendPing(buf[:0], opaque)
-	if s.bdp.shouldProbe(s.recvTotal.Load(), opaque) {
+	if s.bdp.shouldProbe(s.recvTotal.Load(), opaque, time.Now()) {
 		s.w.appendProbe(frame.Header{Type: frame.TypePing}, payload)
 		return
 	}
@@ -175,7 +179,7 @@ func (s *NativeSession) sendProbe() {
 // handful of round trips instead of tens of timer ticks.
 func (s *NativeSession) maybeProbe() {
 	opaque := s.nextProbe.Add(1)
-	if !s.bdp.shouldProbe(s.recvTotal.Load(), opaque) {
+	if !s.bdp.shouldProbe(s.recvTotal.Load(), opaque, time.Now()) {
 		return
 	}
 	var buf [frame.PingLen]byte
@@ -627,6 +631,7 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload, seg []
 	// never fire, since the limit is not frame-aligned.
 	if st.recvLimit-st.recvd < uint64(s.cfg.MaxFrameSize) {
 		s.stalls.Add(1)
+		st.stalledSinceGrow = true
 	}
 	drop := st.readClosed || st.readErr != nil
 	if !drop && len(payload) > 0 {

@@ -54,6 +54,11 @@ type NativeStream struct {
 	readErr    error // terminal read error (reset/cancel/session death)
 	readClosed bool  // local CancelRead/Close: drop incoming silently
 
+	// stalledSinceGrow records that the peer ran out of credit on this
+	// stream since its window last grew — direct evidence the window, not
+	// the path, is the constraint.
+	stalledSinceGrow bool
+
 	// Send side.
 	sent      uint64 // cumulative bytes sent
 	sendLimit uint64 // absolute limit granted by the peer
@@ -195,7 +200,24 @@ func (s *NativeStream) maybeGrowRecvLimitLocked() uint64 {
 	if s.recvLimit-s.consumed >= s.window/2 {
 		return 0
 	}
-	if target := s.sess.bdp.target(); target > s.window {
+
+	// Two independent reasons to enlarge the window, taken at the moment an
+	// update is due so growth never costs an extra frame.
+	target := s.sess.bdp.target()
+	if s.stalledSinceGrow {
+		// This stream's sender ran out of credit since the last growth: a
+		// bigger window is warranted whether or not a BDP sample has
+		// landed. Growth deliberately does not depend on a probe
+		// completing — a probe's ACK travels back through the same
+		// direction as the bulk data it is measuring, so under load it can
+		// be delayed indefinitely, and tying growth to it leaves the
+		// window frozen exactly when it most needs to grow.
+		s.stalledSinceGrow = false
+		if doubled := s.window * 2; doubled > target {
+			target = doubled
+		}
+	}
+	if target > s.window {
 		s.window = s.sess.budget.grow(s.window, target)
 	}
 	s.recvLimit = s.consumed + s.window

@@ -5,6 +5,65 @@ yamux at its 16MB max window with keepalive off, mux at the same 16MB window.
 Comparing our default window against yamux's tuned one measures configuration,
 not implementation — see "A note on windows" below.
 
+## After M6 (autotune convergence, socket tuning, mixed-workload fairness)
+
+| Benchmark | mux | yamux | ratio |
+|---|---|---|---|
+| Relay (proxy: stream→stream) | **7923 MB/s** | 2715 MB/s | **2.92× ahead** |
+| Small msgs, 64 streams | **283 ns/op** | 4781 ns/op | **16.9× ahead** |
+| Bulk 64KB writes | **11779 MB/s** | 6406 MB/s | **1.84× ahead** |
+| Stream open/close | 7.3 µs | 17.1 µs | **2.33× ahead** |
+| Echo RTT 64B | 23.7 µs | 25.6 µs | 1.08× ahead |
+| Mixed: small-msg RTT under 4 bulk streams | **1.11 ms** @ 4141 MB/s bulk | 1.67 ms @ 2511 MB/s bulk | **1.50× lower latency while carrying 1.65× more bulk** |
+| WAN 200ms RTT (`-benchtime=10x`) | 3.72 MB/s | 1.31 MB/s (default window) | **2.84× ahead of the shipped config** |
+
+Design targets: ≥2× bulk (**1.84×**, near), ≥4× many-stream small messages
+(**16.9×**, met), 0 amortized allocations per frame (**not met** — 3/op on
+bulk, 1/op on small messages).
+
+### Mixed workload: measure both axes or the number is meaningless
+
+The mixed benchmark now reports concurrent bulk throughput alongside latency,
+because a mux that moves less data will always look better on latency alone.
+Reported one-sided, the earlier version made this comparison unreadable:
+runs where yamux happened to carry less bulk showed it "winning" latency by
+4×. With both axes reported the result is stable across runs — mux is ahead
+on latency *and* on throughput simultaneously.
+
+Getting there ruled out three plausible causes by measurement, none of which
+was responsible: batch size (shrinking `MaxBatchBytes` 6× changed nothing),
+admission fairness (reserving batch headroom for small writes changed
+nothing), and kernel send-buffer depth (`TCP_NOTSENT_LOWAT` applies cleanly
+on macOS — verified — and changed nothing). What remained was that our own
+higher throughput deepens every queue in the pipeline, including the
+single-reader dispatch path that DESIGN.md already names as a known ceiling.
+
+`TCP_NOTSENT_LOWAT` is kept regardless: it is correct, costs nothing, and
+targets a real queue that this loopback benchmark cannot exercise. Note the
+constant differs per platform (25 on Linux, 0x201 on macOS) — sharing one
+value silently sets an unrelated option on the other platform.
+
+### WAN autotuning: 2.8× the shipped yamux config, still short of hand-tuning
+
+| | throughput |
+|---|---|
+| mux, autotuning from a 64KB floor | 3.72 MB/s |
+| yamux, 256KB default window | 1.31 MB/s |
+| yamux, hand-tuned 16MB window | 19.8 MB/s |
+
+Convergence was made reliable in M6. Growth had been tied to a BDP probe
+completing, but a probe's ACK travels back through the same direction as the
+bulk data it measures, so under load it can be delayed indefinitely — which
+froze the window at its initial size on roughly half of otherwise identical
+runs. Growth now also triggers on a per-stream flow-control stall, which
+needs no round trip, and a lost probe can no longer wedge the estimator.
+After that, convergence is consistent across runs.
+
+A hand-tuned static window still wins here, and the harness (`net.Pipe` plus
+a delay queue, no bandwidth limit) remains too crude to trust for absolute
+numbers. The real gate stays a netem stage on Linux CI. Run the WAN row with
+`-benchtime=10x`; at the default the measurement is all ramp-up.
+
 ## After M5 (BDP autotune, keepalive)
 
 Loopback numbers are unchanged from M4 — autotuning costs nothing when the

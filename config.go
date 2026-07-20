@@ -39,6 +39,15 @@ type Config struct {
 	// disables the liveness check.
 	KeepaliveTimeout time.Duration
 
+	// NotSentLowat caps how much unsent data the kernel holds in the socket
+	// send buffer (TCP_NOTSENT_LOWAT, Linux and macOS). Without it a small
+	// message queued behind bulk writers waits for the whole kernel buffer
+	// to drain, so tail latency reflects kernel bufferbloat rather than our
+	// own queue — the one queue our batching and fairness caps cannot
+	// reach. Zero selects 128KB on TCP carriers; negative leaves the
+	// kernel default. Ignored where the option does not exist.
+	NotSentLowat int
+
 	// MaxFrameSize is the largest DATA payload we accept. Bounds between
 	// frame.FloorMaxFrameSize (16KB) and frame.MaxLength. Default 64KB.
 	MaxFrameSize uint32
@@ -89,6 +98,7 @@ const (
 	defaultMaxWindow      = 16 << 20
 	defaultRecvBudget     = 128 << 20
 	defaultKeepalive      = 20 * time.Second
+	defaultNotSentLowat   = 128 << 10
 )
 
 func buildConfig(in *Config) (Config, error) {
@@ -119,6 +129,12 @@ func buildConfig(in *Config) (Config, error) {
 	}
 	if c.MaxBatchBytes == 0 {
 		c.MaxBatchBytes = defaultMaxBatchBytes
+	}
+	switch {
+	case c.NotSentLowat == 0:
+		c.NotSentLowat = defaultNotSentLowat
+	case c.NotSentLowat < 0:
+		c.NotSentLowat = 0
 	}
 	if c.PerStreamBatchBytes == 0 {
 		c.PerStreamBatchBytes = c.MaxBatchBytes / 4

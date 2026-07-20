@@ -221,7 +221,7 @@ func TestBDPRejectsCongestedSamples(t *testing.T) {
 
 	// A window-limited sample (the sender ran out of credit) grows the
 	// estimate and establishes the min RTT.
-	b.shouldProbe(1<<20, 1)
+	b.shouldProbe(1<<20, 1, time.Now())
 	b.markSent(now, 1<<20, 0)
 	if first := b.onACK(1, 1<<20+512<<10, 1, now.Add(10*time.Millisecond)); first == 0 {
 		t.Fatal("a window-limited sample should have grown the window")
@@ -230,7 +230,7 @@ func TestBDPRejectsCongestedSamples(t *testing.T) {
 	// A stalled sample whose RTT has doubled means the path, not the
 	// window, is the constraint: growing then only deepens queues.
 	before := b.target()
-	b.shouldProbe(1<<21+1<<20, 2)
+	b.shouldProbe(1<<21+1<<20, 2, time.Now())
 	b.markSent(now, 1<<21+1<<20, 1)
 	b.onACK(2, 1<<21+1<<20+512<<10, 2, now.Add(200*time.Millisecond))
 	if b.target() > before {
@@ -242,7 +242,7 @@ func TestBDPRejectsCongestedSamples(t *testing.T) {
 // discarded rather than producing a bogus zero-time RTT.
 func TestBDPIgnoresUnstampedProbe(t *testing.T) {
 	b := newBDPEstimator(64<<10, 8<<20)
-	b.shouldProbe(1<<20, 7)
+	b.shouldProbe(1<<20, 7, time.Now())
 	// No markSent: the flush never happened.
 	if got := b.onACK(7, 1<<21, 1, time.Now()); got != 0 {
 		t.Fatalf("unstamped probe produced a target: %d", got)
@@ -350,20 +350,41 @@ func TestDataIntegrityDuringAutotune(t *testing.T) {
 	}
 }
 
-// Without a flow-control stall there is no evidence the window is what
-// limits the sender, so the window must hold steady.
-func TestBDPDoesNotGrowWithoutStalls(t *testing.T) {
+// An app-limited sample is no evidence the window is the constraint: the
+// sender never stalled and barely used the window it had, so the estimate
+// must hold steady.
+func TestBDPDoesNotGrowWhenAppLimited(t *testing.T) {
 	b := newBDPEstimator(64<<10, 8<<20)
 	now := time.Now()
 	before := b.target()
 
-	b.shouldProbe(1<<20, 1)
+	b.shouldProbe(1<<20, 1, now)
 	b.markSent(now, 1<<20, 5)
-	// Same stall count at ACK: the sender always had credit to spare.
-	if got := b.onACK(1, 1<<20+1<<20, 5, now.Add(10*time.Millisecond)); got != 0 {
-		t.Fatalf("grew without a stall: %d", got)
+	// Same stall count at ACK, and only a few KB moved against a 64KB
+	// window: the application, not the window, was the limit.
+	if got := b.onACK(1, 1<<20+4<<10, 5, now.Add(10*time.Millisecond)); got != 0 {
+		t.Fatalf("grew on an app-limited sample: %d", got)
 	}
 	if b.target() != before {
-		t.Fatalf("window moved without a stall: %d -> %d", before, b.target())
+		t.Fatalf("window moved on an app-limited sample: %d -> %d", before, b.target())
+	}
+}
+
+// A probe that never completes must not disable autotuning for the life of
+// the session: the slot is reclaimed once it is clearly stale.
+func TestBDPRecoversFromLostProbe(t *testing.T) {
+	b := newBDPEstimator(64<<10, 8<<20)
+	now := time.Now()
+
+	if !b.shouldProbe(1<<20, 1, now) {
+		t.Fatal("first probe was not reserved")
+	}
+	b.markSent(now, 1<<20, 0)
+	// Its ACK never arrives. A later probe attempt must reclaim the slot.
+	if b.shouldProbe(1<<21, 2, now.Add(time.Second)) {
+		t.Fatal("reserved a second probe while one was still plausibly in flight")
+	}
+	if !b.shouldProbe(1<<21, 3, now.Add(30*time.Second)) {
+		t.Fatal("a lost probe permanently wedged the estimator")
 	}
 }
