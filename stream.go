@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/giraffesyo/mux/internal/frame"
@@ -59,7 +60,15 @@ type NativeStream struct {
 
 	rd deadline
 	wd deadline
+
+	// wdSet reports whether a write deadline is currently armed, read on
+	// the send hot path to choose the copy path over zero copy.
+	wdSet atomic.Bool
 }
+
+// hasWriteDeadline reports whether this stream's writes must be copied
+// rather than referenced, so a deadline stays enforceable after admission.
+func (s *NativeStream) hasWriteDeadline() bool { return s.wdSet.Load() }
 
 func newStream(sess *NativeSession, id uint32, local bool) *NativeStream {
 	return &NativeStream{
@@ -195,7 +204,10 @@ func (s *NativeStream) Write(p []byte) (int, error) {
 		s.sent += uint64(n)
 		s.mu.Unlock()
 
-		if err := s.sess.writeData(s, p[:n], 0); err != nil {
+		// A stream with an active write deadline takes the copy path: the
+		// deadline could not be honored once the caller's buffer is
+		// pinned in an iovec that the kernel is reading.
+		if err := s.sess.writeData(s, p[:n], 0, s.hasWriteDeadline(), s.wd.wait()); err != nil {
 			return total, err
 		}
 		total += n
@@ -221,7 +233,7 @@ func (s *NativeStream) CloseWrite() error {
 	s.finSent = true
 	s.mu.Unlock()
 
-	err := s.sess.writeData(s, nil, frame.FlagFIN)
+	err := s.sess.writeData(s, nil, frame.FlagFIN, true, s.wd.wait())
 	s.sess.maybeRemove(s)
 	return err
 }
@@ -307,7 +319,7 @@ func (s *NativeStream) RemoteAddr() net.Addr { return s.sess.conn.RemoteAddr() }
 
 func (s *NativeStream) SetDeadline(t time.Time) error {
 	s.rd.set(t)
-	s.wd.set(t)
+	s.setWriteDeadline(t)
 	return nil
 }
 
@@ -317,6 +329,11 @@ func (s *NativeStream) SetReadDeadline(t time.Time) error {
 }
 
 func (s *NativeStream) SetWriteDeadline(t time.Time) error {
-	s.wd.set(t)
+	s.setWriteDeadline(t)
 	return nil
+}
+
+func (s *NativeStream) setWriteDeadline(t time.Time) {
+	s.wd.set(t)
+	s.wdSet.Store(!t.IsZero())
 }

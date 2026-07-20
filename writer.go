@@ -1,0 +1,374 @@
+package mux
+
+import (
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/giraffesyo/mux/internal/frame"
+)
+
+// The send path is group commit: writers append frames to a shared pending
+// batch under one mutex, and whichever writer finds no flush in flight
+// becomes the flusher — it swaps the batch out, releases the mutex, and
+// issues a single writev for the whole batch. Under load one syscall carries
+// many frames across many streams; idle, the flush happens inline in the
+// calling goroutine, so latency equals a direct write.
+//
+// Completion semantics are split (DESIGN.md "Send path"):
+//
+//   - Small payloads are copied into staging at admission, so the io.Writer
+//     contract is already satisfied and the writer returns as soon as its
+//     bytes are queued. Errors latch and surface on a later call.
+//   - Large payloads are referenced directly in the iovec (zero copy), so
+//     that writer must park until the flush containing its bytes resolves —
+//     the kernel is reading the caller's memory until then.
+//
+// A stream with an active write deadline always takes the copy path: a
+// deadline cannot be honored once the caller's buffer is pinned in an iovec.
+const (
+	// zeroCopyThreshold is the payload size at or above which a write is
+	// referenced rather than copied. Below it the memcpy is cheaper than
+	// the goroutine park it would otherwise cost.
+	zeroCopyThreshold = 4 << 10
+
+	// tlsRecordSize is crypto/tls's maximum plaintext record. Coalesced
+	// writes are chunked to it so no copy exceeds what one record carries.
+	tlsRecordSize = 16 << 10
+)
+
+// chunk is one entry in a pending batch: either a reference to caller memory
+// (ref non-nil) or a range of the staging buffer, which may be reallocated
+// as it grows and so cannot be sliced until flush time.
+type chunk struct {
+	ref []byte
+	off int32
+	n   int32
+}
+
+type writer struct {
+	s   *NativeSession
+	tcp *net.TCPConn // non-nil when net.Buffers becomes a real writev
+
+	mu sync.Mutex
+
+	// Pending batch. Control frames are staged separately and placed first
+	// in the iovec so a window update is never trapped behind bulk data.
+	ctl     []byte
+	stage   []byte
+	chunks  []chunk
+	pending int
+
+	// seq is the sequence number the pending batch will carry; doneSeq is
+	// the highest completed one. A parked zero-copy writer waits for
+	// doneSeq to reach the seq its bytes went into.
+	seq     uint64
+	doneSeq uint64
+	err     error // sticky: any carrier error is session-fatal
+
+	// flushed is closed each time a batch completes, then replaced. It is
+	// the wakeup for parked writers and for admission backpressure, and it
+	// is selectable, so write deadlines stay enforceable while waiting.
+	flushed chan struct{}
+
+	flushing bool
+
+	// Flusher-owned scratch, swapped with the pending buffers so neither
+	// side allocates in steady state.
+	fctl     []byte
+	fstage   []byte
+	fchunks  []chunk
+	iov      net.Buffers
+	coalesce []byte
+}
+
+func newWriter(s *NativeSession) *writer {
+	w := &writer{
+		s:       s,
+		flushed: make(chan struct{}),
+		ctl:     make([]byte, 0, 4<<10),
+		stage:   make([]byte, 0, 64<<10),
+		chunks:  make([]chunk, 0, 64),
+		fctl:    make([]byte, 0, 4<<10),
+		fstage:  make([]byte, 0, 64<<10),
+		fchunks: make([]chunk, 0, 64),
+	}
+	// net.Buffers only becomes writev on an exact *net.TCPConn: the
+	// enabling interface inside net is unexported, so no wrapper can
+	// implement it. Anything else is coalesced into one contiguous write.
+	if tcp, ok := s.conn.(*net.TCPConn); ok {
+		w.tcp = tcp
+	}
+	return w
+}
+
+// appendControl queues a control frame and flushes inline if no flush is in
+// flight. Callers must be application goroutines — the session reader uses
+// appendControlAsync, since a reader that blocks on the send path is one
+// half of the classic two-sided gridlock.
+func (w *writer) appendControl(h frame.Header, payload []byte) {
+	if w.stageControl(h, payload) {
+		w.flushLoop()
+	}
+}
+
+// appendControlAsync queues a control frame without ever blocking the
+// caller: if a flush is needed, a goroutine performs it. Used by the reader
+// goroutine for PING ACKs, refusal resets, and protocol GOAWAYs.
+func (w *writer) appendControlAsync(h frame.Header, payload []byte) {
+	if w.stageControl(h, payload) {
+		go w.flushLoop()
+	}
+}
+
+// stageControl appends the frame and reports whether the caller took
+// ownership of flushing. Control frames never wait on the batch cap: they
+// are small, bounded, and some originate on the reader goroutine.
+func (w *writer) stageControl(h frame.Header, payload []byte) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return false
+	}
+	h.Length = uint32(len(payload))
+	var hdr [frame.HeaderSize]byte
+	h.Encode(hdr[:])
+	w.ctl = append(w.ctl, hdr[:]...)
+	w.ctl = append(w.ctl, payload...)
+	w.pending += frame.HeaderSize + len(payload)
+	return w.claimFlushLocked()
+}
+
+// appendData queues one DATA frame for st. Small payloads return once
+// staged; large ones park until their flush resolves.
+//
+// SYN is attached if this is the stream's first frame on the wire, decided
+// under w.mu together with the append, so concurrent senders can neither
+// duplicate the SYN nor let a later frame overtake it.
+func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags, copyOnly bool, deadline <-chan struct{}) error {
+	total := frame.HeaderSize + len(payload)
+
+	w.mu.Lock()
+	// Admission backpressure: bound the batch so flush duration, staging
+	// occupancy, and every co-batched writer's latency floor stay bounded.
+	// This wait is pre-admission, so write deadlines legally apply here.
+	for w.err == nil && w.pending > 0 && w.pending+total > w.s.cfg.MaxBatchBytes {
+		ch := w.flushed
+		flush := w.claimFlushLocked()
+		w.mu.Unlock()
+		if flush {
+			w.flushLoop()
+		} else {
+			select {
+			case <-ch:
+			case <-deadline:
+				return os.ErrDeadlineExceeded
+			case <-w.s.done:
+				return w.s.closedErr()
+			}
+		}
+		w.mu.Lock()
+	}
+	if w.err != nil {
+		err := w.err
+		w.mu.Unlock()
+		return err
+	}
+
+	if !st.synSent {
+		flags |= frame.FlagSYN
+		st.synSent = true
+	}
+	var hdr [frame.HeaderSize]byte
+	frame.Header{
+		Type:     frame.TypeData,
+		Flags:    flags,
+		StreamID: st.id,
+		Length:   uint32(len(payload)),
+	}.Encode(hdr[:])
+
+	// The header always goes to staging; the payload is copied or
+	// referenced depending on size and whether a deadline is active.
+	zeroCopy := !copyOnly && len(payload) >= zeroCopyThreshold
+	off := int32(len(w.stage))
+	w.stage = append(w.stage, hdr[:]...)
+	if !zeroCopy {
+		w.stage = append(w.stage, payload...)
+	}
+	w.chunks = append(w.chunks, chunk{off: off, n: int32(len(w.stage)) - off})
+	if zeroCopy {
+		w.chunks = append(w.chunks, chunk{ref: payload})
+	}
+	w.pending += total
+
+	mySeq := w.seq
+	flush := w.claimFlushLocked()
+	w.mu.Unlock()
+
+	if flush {
+		w.flushLoop()
+	}
+	if !zeroCopy {
+		// Bytes are session-owned: the caller may reuse its buffer, and
+		// any error surfaces on a later call.
+		return nil
+	}
+
+	// Park until the flush carrying this payload resolves. There is no
+	// deadline case here: a stream with an active write deadline took the
+	// copy path above.
+	w.mu.Lock()
+	for w.doneSeq < mySeq && w.err == nil {
+		ch := w.flushed
+		w.mu.Unlock()
+		select {
+		case <-ch:
+		case <-w.s.done:
+			w.mu.Lock()
+			if w.err == nil {
+				w.err = w.s.closedErr()
+			}
+			err := w.err
+			w.mu.Unlock()
+			return err
+		}
+		w.mu.Lock()
+	}
+	err := w.err
+	w.mu.Unlock()
+	return err
+}
+
+// claimFlushLocked makes the caller the flusher when none is running and
+// there is work. Any enqueue may claim it, control included: a download-only
+// session has no data writers, so window updates would otherwise never reach
+// the wire and the transfer would deadlock once the initial window drained.
+func (w *writer) claimFlushLocked() bool {
+	if w.flushing || w.pending == 0 || w.err != nil {
+		return false
+	}
+	w.flushing = true
+	return true
+}
+
+// flushLoop drains the pending batch, re-checking after each writev so the
+// carrier stays continuously fed with no goroutine wakeup between
+// back-to-back flushes. The caller has already claimed flusher duty.
+//
+// Flusher duty is unconditional: this returns only with the batch drained or
+// the session failed, never leaving a non-empty batch with no flusher.
+func (w *writer) flushLoop() {
+	for {
+		w.mu.Lock()
+		if w.pending == 0 || w.err != nil {
+			w.flushing = false
+			w.wakeLocked()
+			w.mu.Unlock()
+			return
+		}
+		seq := w.seq
+		w.seq++
+
+		// Swap the pending buffers with the flusher's scratch: neither
+		// side allocates once both have grown to steady-state size.
+		w.fctl, w.ctl = w.ctl, w.fctl[:0]
+		w.fstage, w.stage = w.stage, w.fstage[:0]
+		w.fchunks, w.chunks = w.chunks, w.fchunks[:0]
+		w.pending = 0
+		w.mu.Unlock()
+
+		err := w.writeOut()
+
+		w.mu.Lock()
+		w.doneSeq = seq
+		if err != nil && w.err == nil {
+			w.err = err
+		}
+		w.wakeLocked()
+		// The sticky error may already be set by fail() while this flush
+		// succeeded — a session dying for an unrelated reason. Either way
+		// flushing stops, but only our own carrier error kills the session.
+		done := w.err != nil
+		if done {
+			w.flushing = false
+		}
+		w.mu.Unlock()
+
+		if err != nil {
+			// Outside the lock: fatal closes the carrier and destroys
+			// streams, and calls back into fail().
+			w.s.fatal(&SessionError{Code: CodeInternal, Reason: "carrier write: " + err.Error()})
+			return
+		}
+		if done {
+			return
+		}
+	}
+}
+
+// wakeLocked releases everyone parked on the current batch generation.
+func (w *writer) wakeLocked() {
+	close(w.flushed)
+	w.flushed = make(chan struct{})
+}
+
+// writeOut issues the swapped-out batch. Control bytes lead the iovec, so a
+// window update is never delayed behind queued bulk data.
+func (w *writer) writeOut() error {
+	w.iov = w.iov[:0]
+	if len(w.fctl) > 0 {
+		w.iov = append(w.iov, w.fctl)
+	}
+	for _, c := range w.fchunks {
+		if c.ref != nil {
+			w.iov = append(w.iov, c.ref)
+			continue
+		}
+		w.iov = append(w.iov, w.fstage[c.off:c.off+c.n])
+	}
+	if len(w.iov) == 0 {
+		return nil
+	}
+
+	if w.s.cfg.WriteTimeout > 0 {
+		_ = w.s.conn.SetWriteDeadline(time.Now().Add(w.s.cfg.WriteTimeout))
+		defer func() { _ = w.s.conn.SetWriteDeadline(time.Time{}) }()
+	}
+
+	if w.tcp != nil {
+		// net.Buffers.WriteTo issues writev, looping past the 1024-iovec
+		// kernel limit, so a flush is not assumed to be one syscall.
+		_, err := w.iov.WriteTo(w.tcp)
+		return err
+	}
+
+	// Any other carrier (TLS, wrappers, Windows) gets one contiguous write
+	// instead of one write per buffer. Over TLS this is still split into
+	// 16KB records by crypto/tls, each its own carrier write; chunking the
+	// copy at that size keeps no memcpy larger than a record can carry.
+	w.coalesce = w.coalesce[:0]
+	for _, b := range w.iov {
+		w.coalesce = append(w.coalesce, b...)
+	}
+	buf := w.coalesce
+	for len(buf) > 0 {
+		n := min(len(buf), tlsRecordSize)
+		if _, err := w.s.conn.Write(buf[:n]); err != nil {
+			return err
+		}
+		buf = buf[n:]
+	}
+	return nil
+}
+
+// fail releases every parked writer when the session dies for a reason the
+// writer did not observe itself (carrier read error, local Close).
+func (w *writer) fail(err error) {
+	w.mu.Lock()
+	if w.err == nil {
+		w.err = err
+	}
+	w.wakeLocked()
+	w.mu.Unlock()
+}

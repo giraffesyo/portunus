@@ -33,9 +33,7 @@ type NativeSession struct {
 	peerMaxFrame      atomic.Uint32
 	peerMaxStreams    atomic.Uint64
 
-	writeMu sync.Mutex // serializes carrier writes; held across one frame
-	hdrBuf  [frame.HeaderSize]byte
-	ctlBuf  []byte
+	w *writer // group-commit send path
 
 	mu       sync.Mutex // guards the fields below
 	streams  map[uint32]*NativeStream
@@ -83,8 +81,8 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 		accept:   make(chan *NativeStream, c.AcceptBacklog),
 		done:     make(chan struct{}),
 		readDone: make(chan struct{}),
-		ctlBuf:   make([]byte, 0, 64),
 	}
+	s.w = newWriter(s)
 	if client {
 		s.nextID = 1
 	} else {
@@ -119,112 +117,51 @@ func (s *NativeSession) sendSettings() error {
 	if err != nil {
 		return err
 	}
-	return s.writeFrame(frame.Header{
-		Type:   frame.TypeSettings,
-		Length: uint32(len(payload)),
-	}, payload)
-}
-
-// writeFrame writes one header (+payload) to the carrier under writeMu. A
-// carrier write error or timeout is session-fatal: a partially written frame
-// has already desynced the wire.
-func (s *NativeSession) writeFrame(h frame.Header, payload []byte) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.writeFrameLocked(h, payload)
-}
-
-func (s *NativeSession) writeFrameLocked(h frame.Header, payload []byte) error {
-	if err := s.closedErr(); err != nil {
-		return err
-	}
-	if s.cfg.WriteTimeout > 0 {
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
-	}
-	h.Encode(s.hdrBuf[:])
-	var err error
-	if len(payload) == 0 {
-		_, err = s.conn.Write(s.hdrBuf[:])
-	} else {
-		// M2 keeps this simple and correct: two writes. M3's group commit
-		// replaces it with one batched writev across streams.
-		if _, err = s.conn.Write(s.hdrBuf[:]); err == nil {
-			_, err = s.conn.Write(payload)
-		}
-	}
-	if s.cfg.WriteTimeout > 0 {
-		_ = s.conn.SetWriteDeadline(time.Time{})
-	}
-	if err != nil {
-		s.fatal(&SessionError{Code: CodeInternal, Reason: "carrier write: " + err.Error()})
-		return s.closedErr()
-	}
+	s.w.appendControl(frame.Header{Type: frame.TypeSettings}, payload)
 	return nil
 }
 
-// writeData sends one DATA frame for s, attaching SYN if this is the
-// stream's first frame on the wire. synSent is flipped under writeMu so SYN
-// cannot race ahead of, or duplicate across, concurrent senders.
-func (s *NativeSession) writeData(st *NativeStream, payload []byte, flags frame.Flags) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if !st.synSent {
-		flags |= frame.FlagSYN
-		st.synSent = true
-	}
-	return s.writeFrameLocked(frame.Header{
-		Type:     frame.TypeData,
-		Flags:    flags,
-		StreamID: st.id,
-		Length:   uint32(len(payload)),
-	}, payload)
+// writeData queues one DATA frame for st through the group-commit path.
+// copyOnly forces the staging path for streams with an active write
+// deadline, whose caller cannot be pinned in an iovec.
+func (s *NativeSession) writeData(st *NativeStream, payload []byte, flags frame.Flags, copyOnly bool, deadline <-chan struct{}) error {
+	return s.w.appendData(st, payload, flags, copyOnly, deadline)
 }
 
-// writeRST resets st's send side. A stream whose SYN never reached the wire
-// is canceled purely locally: the peer must never see an RST for a stream it
-// has not heard of.
-func (s *NativeSession) writeRST(st *NativeStream, code, finalSize uint64) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if !st.synSent {
+// streamControl queues a per-stream control frame. A stream whose SYN never
+// reached the wire is skipped: the peer must never see a frame for a stream
+// it has not heard of.
+func (s *NativeSession) streamControl(st *NativeStream, h frame.Header, payload []byte) {
+	s.w.mu.Lock()
+	seen := st.synSent
+	s.w.mu.Unlock()
+	if !seen {
 		return
 	}
-	s.ctlBuf = frame.AppendRST(s.ctlBuf[:0], code, finalSize)
-	_ = s.writeFrameLocked(frame.Header{
-		Type:     frame.TypeRST,
-		StreamID: st.id,
-		Length:   frame.RSTLen,
-	}, s.ctlBuf)
+	h.StreamID = st.id
+	s.w.appendControl(h, payload)
+}
+
+// The control payloads below are built in stack arrays: stageControl copies
+// them into the batch and never retains them, so nothing escapes and the
+// control path stays allocation-free.
+
+func (s *NativeSession) writeRST(st *NativeStream, code, finalSize uint64) {
+	var buf [frame.RSTLen]byte
+	s.streamControl(st, frame.Header{Type: frame.TypeRST},
+		frame.AppendRST(buf[:0], code, finalSize))
 }
 
 func (s *NativeSession) writeStopSending(st *NativeStream, code uint64) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if !st.synSent {
-		return
-	}
-	s.ctlBuf = frame.AppendStopSending(s.ctlBuf[:0], code)
-	_ = s.writeFrameLocked(frame.Header{
-		Type:     frame.TypeStopSending,
-		StreamID: st.id,
-		Length:   frame.StopSendingLen,
-	}, s.ctlBuf)
+	var buf [frame.StopSendingLen]byte
+	s.streamControl(st, frame.Header{Type: frame.TypeStopSending},
+		frame.AppendStopSending(buf[:0], code))
 }
 
 func (s *NativeSession) sendWindowUpdate(st *NativeStream, limit uint64) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if !st.synSent {
-		// Nothing sent yet on a locally opened stream: the peer has no
-		// state for this ID. Our SYN will ride the first DATA frame.
-		return
-	}
-	s.ctlBuf = frame.AppendWindowUpdate(s.ctlBuf[:0], limit)
-	_ = s.writeFrameLocked(frame.Header{
-		Type:     frame.TypeWindowUpdate,
-		StreamID: st.id,
-		Length:   frame.WindowUpdateLen,
-	}, s.ctlBuf)
+	var buf [frame.WindowUpdateLen]byte
+	s.streamControl(st, frame.Header{Type: frame.TypeWindowUpdate},
+		frame.AppendWindowUpdate(buf[:0], limit))
 }
 
 // OpenStream opens a stream. It is local and costs no syscall: SYN rides the
@@ -363,13 +300,11 @@ func (s *NativeSession) dispatch(h frame.Header, payload []byte) error {
 			return errSessionTerminated
 		}
 		if h.Flags&frame.FlagACK == 0 {
+			// Async: the reader must never block on the send path.
 			var buf [frame.PingLen]byte
-			frame.AppendPing(buf[:0], opaque)
-			_ = s.writeFrame(frame.Header{
-				Type:   frame.TypePing,
-				Flags:  frame.FlagACK,
-				Length: frame.PingLen,
-			}, buf[:])
+			s.w.appendControlAsync(
+				frame.Header{Type: frame.TypePing, Flags: frame.FlagACK},
+				frame.AppendPing(buf[:0], opaque))
 		}
 		return nil
 
@@ -486,8 +421,12 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload []byte) error {
 		if refuse {
 			s.mu.Unlock()
 			// No state is created for a refused stream; the payload is
-			// dropped and never counted against any budget.
-			s.refuse(h.StreamID)
+			// dropped and never counted against any budget. Async: this
+			// runs on the reader goroutine.
+			var buf [frame.RSTLen]byte
+			s.w.appendControlAsync(
+				frame.Header{Type: frame.TypeRST, StreamID: h.StreamID},
+				frame.AppendRST(buf[:0], CodeRefused, 0))
 			return nil
 		}
 		st = newStream(s, h.StreamID, false)
@@ -543,19 +482,6 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload []byte) error {
 		s.onStopSending(st, code)
 	}
 	return nil
-}
-
-// refuse rejects a stream we will not accept. RST is safe here: the peer's
-// SYN proves it knows the ID.
-func (s *NativeSession) refuse(id uint32) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	s.ctlBuf = frame.AppendRST(s.ctlBuf[:0], CodeRefused, 0)
-	_ = s.writeFrameLocked(frame.Header{
-		Type:     frame.TypeRST,
-		StreamID: id,
-		Length:   frame.RSTLen,
-	}, s.ctlBuf)
 }
 
 func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte) error {
@@ -700,10 +626,9 @@ func (s *NativeSession) sendGoAway(code uint64, reason string) {
 	if err != nil {
 		return
 	}
-	_ = s.writeFrame(frame.Header{
-		Type:   frame.TypeGoAway,
-		Length: uint32(len(payload)),
-	}, payload)
+	// Async: sendGoAway is reached both from application goroutines and
+	// from the reader's protocol-error path, which must never block.
+	s.w.appendControlAsync(frame.Header{Type: frame.TypeGoAway}, payload)
 }
 
 // Shutdown drains gracefully: GOAWAY, stop accepting new streams, then wait
@@ -759,6 +684,9 @@ func (s *NativeSession) fatal(err error) {
 		s.mu.Unlock()
 
 		close(s.done)
+		// Release parked writers before closing the carrier, so nobody is
+		// left waiting on a flush that will never complete.
+		s.w.fail(err)
 		for _, st := range sts {
 			st.destroy(err)
 		}

@@ -39,6 +39,13 @@ type Config struct {
 	// ReadBufferSize is the parse buffer for the session reader.
 	// Zero selects 32KB.
 	ReadBufferSize int
+
+	// MaxBatchBytes bounds one group-commit batch. It caps flush duration
+	// — every co-batched writer's latency floor — along with staging
+	// occupancy and the coalesce buffer for non-writev carriers. Writers
+	// beyond it block at admission, where write deadlines still apply.
+	// Zero selects 512KB.
+	MaxBatchBytes int
 }
 
 const (
@@ -48,6 +55,7 @@ const (
 	defaultAcceptBacklog  = 128
 	defaultWriteTimeout   = 30 * time.Second
 	defaultReadBufferSize = 32 << 10
+	defaultMaxBatchBytes  = 512 << 10
 )
 
 func buildConfig(in *Config) (Config, error) {
@@ -76,6 +84,9 @@ func buildConfig(in *Config) (Config, error) {
 	if c.ReadBufferSize == 0 {
 		c.ReadBufferSize = defaultReadBufferSize
 	}
+	if c.MaxBatchBytes == 0 {
+		c.MaxBatchBytes = defaultMaxBatchBytes
+	}
 
 	if c.InitialWindow < frame.FloorInitialWindow {
 		return c, fmt.Errorf("mux: InitialWindow %d below protocol floor %d", c.InitialWindow, frame.FloorInitialWindow)
@@ -88,6 +99,11 @@ func buildConfig(in *Config) (Config, error) {
 	}
 	if c.AcceptBacklog < 1 {
 		return c, fmt.Errorf("mux: AcceptBacklog %d < 1", c.AcceptBacklog)
+	}
+	// A batch must be able to hold at least one maximum-size frame, or a
+	// full-size write could never be admitted.
+	if minBatch := int(c.MaxFrameSize) + frame.HeaderSize; c.MaxBatchBytes < minBatch {
+		return c, fmt.Errorf("mux: MaxBatchBytes %d below one max frame (%d)", c.MaxBatchBytes, minBatch)
 	}
 	return c, nil
 }
