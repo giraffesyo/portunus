@@ -4,10 +4,17 @@ A stream multiplexer for Go: many logical streams over one reliable
 byte-stream carrier (TCP, TLS, a Unix socket, an SSH channel — anything
 satisfying `net.Conn`).
 
-**Status: in development.** The wire format and the correct core are done and
-tested; the performance machinery is not yet built. See
-[DESIGN.md](DESIGN.md) for the full architecture and
-[bench/BASELINE.md](bench/BASELINE.md) for where performance stands today.
+**Status: in development, not yet released.** The protocol, the core, and the
+performance machinery are built and tested; the QUIC adapter and hardening
+pass are not. See [DESIGN.md](DESIGN.md) for the architecture and
+[bench/BASELINE.md](bench/BASELINE.md) for measured numbers, including what
+does not yet win.
+
+Against tuned yamux on loopback TCP: **2.9× on relay** (the proxy workload),
+**20× on many-stream small messages**, **1.8× on single-stream bulk**, 2.3×
+on stream churn, and parity on echo latency. On a high-RTT path, autotuning
+beats yamux's default configuration but not a hand-tuned static window — an
+open problem documented in the baseline.
 
 - **Zero dependencies** outside the standard library, forever. Benchmarks and
   the QUIC adapter live in separate modules so `go get` stays clean.
@@ -73,10 +80,10 @@ benchmark against tuned (not default) baselines.
 |-----------|------|-------|
 | M1 | Wire format, frame codec, fuzz targets | done |
 | M2 | Correct core: lifecycle, flow control, receiver rules, tests | done |
-| M3 | Group commit: batched writev send path | next |
-| M4 | Receive fast paths: segment pools, zero-copy relay | planned |
-| M5 | BDP-autotuned flow control | planned |
-| M6 | Hit the performance targets | planned |
+| M3 | Group commit: batched writev send path | done |
+| M4 | Receive fast paths: segment pools, zero-copy relay | done |
+| M5 | BDP-autotuned flow control, keepalive | done |
+| M6 | Hit the performance targets (WAN autotune, tail latency) | next |
 | M7 | QUIC adapter (`adapters/quic`) | planned |
 | M8 | Fuzzing, soak, hardening, docs | planned |
 
