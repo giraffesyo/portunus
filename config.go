@@ -86,6 +86,13 @@ type Config struct {
 	// WriteTimeout bounds each carrier write. Expiry is session-fatal: a
 	// partially written frame has already desynced the wire. Zero selects
 	// the 30s default; negative disables.
+	//
+	// Disabling it removes the only bound on a large Write whose payload is
+	// referenced rather than copied: such a writer parks until its flush
+	// resolves, and a per-stream write deadline cannot release it, since a
+	// stream with a deadline takes the copy path instead. With both
+	// disabled, a peer that stops reading parks that goroutine until the
+	// session ends.
 	WriteTimeout time.Duration
 
 	// ReadBufferSize is the parse buffer for the session reader. It is

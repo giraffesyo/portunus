@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"testing"
@@ -119,4 +120,48 @@ func testTLS(t *testing.T) (server, client *tls.Config) {
 			NextProtos: []string{"mux-conformance"},
 			MinVersion: tls.VersionTLS13,
 		}
+}
+
+// Shutdown must wait for the streams the application still holds rather than
+// closing on a timer: the native session drains, and the same interface
+// method should not truncate a transfer just because QUIC is underneath.
+func TestShutdownDrainsLiveStreams(t *testing.T) {
+	client, server := quicPair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	go func() {
+		for {
+			st, err := server.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go func(st mux.Stream) { io.Copy(st, st); st.CloseWrite() }(st)
+		}
+	}()
+
+	st, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write([]byte("in flight")); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- client.Shutdown(ctx) }()
+
+	// Shutdown must still be waiting while the stream is open.
+	select {
+	case err := <-done:
+		t.Fatalf("Shutdown returned (%v) while a stream was still open", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	st.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not finish after the last stream closed")
+	}
 }

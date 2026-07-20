@@ -364,3 +364,73 @@ func TestRapidChurnAllowedByDefault(t *testing.T) {
 		t.Fatalf("rapid churn was rejected by default: %v", err)
 	}
 }
+
+// A write that fails at batch admission must give its flow-control credit
+// back. Without that, every deadline expiry permanently shrinks the window
+// until the stream cannot send at all even though the peer keeps granting
+// credit.
+func TestFailedWriteReturnsCredit(t *testing.T) {
+	client, server := pair(t, nil)
+	cs, _ := openAccept(t, client, server)
+	st := cs.(*NativeStream)
+
+	st.mu.Lock()
+	before := st.sent
+	st.mu.Unlock()
+
+	// A deadline already in the past fails the write without sending.
+	st.SetWriteDeadline(time.Now().Add(-time.Second))
+	if _, err := st.Write(make([]byte, 32<<10)); err == nil {
+		t.Fatal("write past its deadline succeeded")
+	}
+
+	st.mu.Lock()
+	after := st.sent
+	st.mu.Unlock()
+	if after != before {
+		t.Fatalf("failed write consumed %d bytes of credit (sent %d -> %d)", after-before, before, after)
+	}
+}
+
+// The first batch is sequence zero, and a zero-copy writer that joins it must
+// still wait for the flush: returning early would let the caller reuse a
+// buffer the kernel is reading out of the iovec.
+func TestFirstBatchZeroCopyWriterWaits(t *testing.T) {
+	client, server := pair(t, nil)
+	c := ctx(t)
+
+	go func() {
+		st, err := server.AcceptStream(c)
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, st)
+	}()
+
+	st, err := client.OpenStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a zero-copy sized payload, then immediately overwrite the
+	// buffer. If Write returned before its flush, the overwrite races the
+	// kernel read and the race detector reports it.
+	buf := make([]byte, 64<<10)
+	for range 50 {
+		if _, err := st.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+		for i := range buf {
+			buf[i] = byte(i)
+		}
+	}
+
+	// The writer must never observe a batch it joined as already complete.
+	w := client.w
+	w.mu.Lock()
+	doneSeq, seq := w.doneSeq, w.seq
+	w.mu.Unlock()
+	if doneSeq > seq {
+		t.Fatalf("completed batches (%d) exceeds batches started (%d)", doneSeq, seq)
+	}
+}

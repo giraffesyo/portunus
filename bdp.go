@@ -263,6 +263,13 @@ func (b *budget) grow(have, want uint64) uint64 {
 	return want
 }
 
+// outstanding reports the total credit currently granted.
+func (b *budget) outstanding() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.granted
+}
+
 // release returns a finished stream's window to the session budget.
 func (b *budget) release(window uint64) {
 	b.mu.Lock()

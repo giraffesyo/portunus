@@ -145,6 +145,9 @@ func (s *NativeStream) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	for {
+		if isClosedChan(s.rd.wait()) {
+			return 0, os.ErrDeadlineExceeded
+		}
 		s.mu.Lock()
 		if len(s.rq) > 0 {
 			n := 0
@@ -271,7 +274,12 @@ func (s *NativeStream) WriteTo(dst io.Writer) (int64, error) {
 		}
 		if len(s.drain) > 0 {
 			clear(s.drain)
-			s.sess.maybeRemove(s)
+			// Only worth probing once the peer has finished sending;
+			// otherwise this takes the stream lock every drain cycle on
+			// the hot relay path to learn nothing.
+			if fin {
+				s.sess.maybeRemove(s)
+			}
 			continue
 		}
 
@@ -327,6 +335,14 @@ func (s *NativeStream) Write(p []byte) (int, error) {
 	defer s.wmu.Unlock()
 	total := 0
 	for len(p) > 0 {
+		// An expired deadline fails the write even when the send path
+		// could satisfy it immediately. net.Conn requires a deadline
+		// already in the past to be honored — checking only where the
+		// write would block lets a call slip through whenever the batch
+		// happens to be empty, which is exactly when it is least expected.
+		if isClosedChan(s.wd.wait()) {
+			return total, os.ErrDeadlineExceeded
+		}
 		s.mu.Lock()
 		for {
 			if err := s.writeErr; err != nil {
@@ -363,6 +379,15 @@ func (s *NativeStream) Write(p []byte) (int, error) {
 		// deadline could not be honored once the caller's buffer is
 		// pinned in an iovec that the kernel is reading.
 		if err := s.sess.writeData(s, p[:n], 0, s.hasWriteDeadline(), s.wd.wait()); err != nil {
+			// Give the credit back. These bytes were reserved above but
+			// never reached the wire — admission can fail on a write
+			// deadline while the stream stays perfectly usable, and
+			// keeping the reservation would shrink the window by n on
+			// every such expiry until the stream could never send again.
+			s.mu.Lock()
+			s.sent -= uint64(n)
+			s.mu.Unlock()
+			notify(s.writable)
 			return total, err
 		}
 		total += n

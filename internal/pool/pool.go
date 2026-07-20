@@ -53,7 +53,10 @@ func (b Buf) Bytes() []byte {
 	if b.p == nil {
 		return nil
 	}
-	return (*b.p)[:b.size]
+	// Full slice expression: capping capacity at the valid length means an
+	// append by any consumer allocates a new array instead of writing into
+	// pooled memory that a later Get will hand to another stream.
+	return (*b.p)[:b.size:b.size]
 }
 
 // Get returns a buffer of exactly n bytes.

@@ -695,21 +695,21 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte,
 		}
 	}()
 
+	if len(payload) == 0 && h.Flags == 0 {
+		// Carries nothing, opens nothing, closes nothing — pure parse and
+		// dispatch cost, and it consumes no flow-control credit, so no
+		// byte budget will ever notice it. Checked before taking the lock:
+		// it reads only this frame's own fields.
+		if !s.noopLimit.allow(time.Now()) {
+			return s.tooMuch("empty frame flood")
+		}
+	}
+
 	st.mu.Lock()
 	if st.finRecvd && (len(payload) > 0 || h.Flags&frame.FlagFIN != 0) {
 		st.mu.Unlock()
 		s.fatalProtocol(CodeProtocol, "DATA after FIN")
 		return errSessionTerminated
-	}
-	if len(payload) == 0 && h.Flags == 0 {
-		// Carries nothing, opens nothing, closes nothing — pure parse and
-		// dispatch cost, and it consumes no flow-control credit, so no
-		// byte budget will ever notice it.
-		st.mu.Unlock()
-		if !s.noopLimit.allow(time.Now()) {
-			return s.tooMuch("empty frame flood")
-		}
-		st.mu.Lock()
 	}
 	if len(payload) > 0 {
 		st.lastActive.Store(time.Now().UnixNano())
@@ -726,7 +726,11 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte,
 	// cannot send a full frame without waiting for us. That is the signal
 	// autotuning grows on. Testing for exactly zero credit would almost
 	// never fire, since the limit is not frame-aligned.
-	if st.recvLimit-st.recvd < uint64(s.cfg.MaxFrameSize) {
+	// Counted on the edge, not on every frame that arrives with the window
+	// nearly full: stalledSinceGrow is cleared when the window next grows,
+	// so this fires once per stall rather than once per frame, and
+	// Stats.WindowStalls stays comparable across frame sizes.
+	if !st.stalledSinceGrow && st.recvLimit-st.recvd < uint64(s.cfg.MaxFrameSize) {
 		s.stalls.Add(1)
 		s.stats.windowStalls.Add(1)
 		st.stalledSinceGrow = true

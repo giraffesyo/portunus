@@ -18,6 +18,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/giraffesyo/mux"
@@ -27,6 +29,10 @@ import (
 // Session wraps a QUIC connection. It satisfies mux.Session.
 type Session struct {
 	conn *quicgo.Conn
+
+	// live counts streams handed to the application and not yet closed,
+	// so Shutdown can drain. QUIC exposes no stream count of its own.
+	live atomic.Int64
 }
 
 // Stream wraps a QUIC stream. It satisfies mux.Stream, and therefore
@@ -35,6 +41,9 @@ type Session struct {
 type Stream struct {
 	st   *quicgo.Stream
 	conn *quicgo.Conn
+
+	sess     *Session
+	closeOne sync.Once
 }
 
 var (
@@ -93,7 +102,8 @@ func (s *Session) OpenStream(ctx context.Context) (mux.Stream, error) {
 	if err != nil {
 		return nil, translate(err)
 	}
-	return &Stream{st: st, conn: s.conn}, nil
+	s.live.Add(1)
+	return &Stream{st: st, conn: s.conn, sess: s}, nil
 }
 
 // AcceptStream returns the next stream opened by the peer.
@@ -102,31 +112,37 @@ func (s *Session) AcceptStream(ctx context.Context) (mux.Stream, error) {
 	if err != nil {
 		return nil, translate(err)
 	}
-	return &Stream{st: st, conn: s.conn}, nil
+	s.live.Add(1)
+	return &Stream{st: st, conn: s.conn, sess: s}, nil
 }
 
-// Shutdown drains gracefully, waiting for live streams to finish before
-// closing, or until ctx expires.
+// Shutdown drains gracefully: it waits for the streams the application still
+// holds to be closed, then closes the connection. It returns ctx.Err() if the
+// drain does not finish in time, matching the native session.
 //
 // QUIC has no GOAWAY equivalent in the transport itself — draining is an
-// application-layer concern there (HTTP/3 defines its own) — so this cannot
-// tell the peer to stop opening streams. It waits for quiet and then closes,
-// which is the honest approximation.
+// application-layer concern there, which is why HTTP/3 defines its own — so
+// this cannot tell the peer to stop opening new streams. What it can do, and
+// does, is not cut off the ones already running: closing on a fixed timer
+// instead would truncate an in-flight transfer, and would make the same
+// interface method behave differently depending on the transport underneath.
 func (s *Session) Shutdown(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		_ = s.Close()
-		return ctx.Err()
-	case <-s.conn.Context().Done():
-		return translate(context.Cause(s.conn.Context()))
-	case <-time.After(gracePeriod):
-		return s.Close()
+	t := time.NewTicker(2 * time.Millisecond)
+	defer t.Stop()
+	for {
+		if s.live.Load() == 0 {
+			return s.Close()
+		}
+		select {
+		case <-ctx.Done():
+			_ = s.Close()
+			return ctx.Err()
+		case <-s.conn.Context().Done():
+			return translate(context.Cause(s.conn.Context()))
+		case <-t.C:
+		}
 	}
 }
-
-// gracePeriod bounds how long Shutdown waits before closing when the
-// connection stays open and ctx has no deadline.
-const gracePeriod = 100 * time.Millisecond
 
 // CloseWithError terminates the connection, reporting code and msg to the
 // peer.
@@ -165,6 +181,13 @@ func (s *Stream) CloseWrite() error { return translate(s.st.Close()) }
 func (s *Stream) Close() error {
 	err := s.st.Close()
 	s.st.CancelRead(quicgo.StreamErrorCode(mux.CodeCanceled))
+	// Counted once however often Close is called, so Shutdown's drain
+	// cannot be driven negative by a caller that closes twice.
+	s.closeOne.Do(func() {
+		if s.sess != nil {
+			s.sess.live.Add(-1)
+		}
+	})
 	return translate(err)
 }
 

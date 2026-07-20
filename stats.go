@@ -129,9 +129,6 @@ func (s *NativeSession) Stats() Stats {
 	out.StreamsLive = uint64(len(s.streams))
 	s.mu.Unlock()
 
-	s.budget.mu.Lock()
-	out.GrantedBytes = s.budget.granted
-	s.budget.mu.Unlock()
-
+	out.GrantedBytes = s.budget.outstanding()
 	return out
 }

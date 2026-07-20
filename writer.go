@@ -65,9 +65,21 @@ type writer struct {
 	chunks  []chunk
 	pending int
 
+	// frames and payload are counted as the batch is assembled, because a
+	// zero-copy frame contributes two chunks and the iovec carries framing
+	// bytes: deriving either from the assembled iovec double-counts frames
+	// and reports headers as payload.
+	frames  uint64
+	payload uint64
+
 	// seq is the sequence number the pending batch will carry; doneSeq is
-	// the highest completed one. A parked zero-copy writer waits for
-	// doneSeq to reach the seq its bytes went into.
+	// the count of batches that have completed, so a parked zero-copy
+	// writer waits for doneSeq to exceed the seq its bytes went into.
+	//
+	// A count rather than "the last completed seq": with both starting at
+	// zero the two are indistinguishable for the very first batch, and a
+	// writer that joined it would evaluate its wait condition as already
+	// satisfied and return while the kernel was still reading its buffer.
 	seq     uint64
 	doneSeq uint64
 	err     error // sticky: any carrier error is session-fatal
@@ -86,6 +98,8 @@ type writer struct {
 	// timestamp it as it reaches the carrier rather than at enqueue.
 	pingStamp  bool
 	fpingStamp bool
+	fframes    uint64
+	fpayload   uint64
 
 	// Flusher-owned scratch, swapped with the pending buffers so neither
 	// side allocates in steady state.
@@ -175,6 +189,7 @@ func (w *writer) stage2(h frame.Header, payload []byte, stamp bool) bool {
 	h.Encode(hdr[:])
 	w.ctl = append(w.ctl, hdr[:]...)
 	w.ctl = append(w.ctl, payload...)
+	w.frames++
 	w.pending += frame.HeaderSize + len(payload)
 	return w.claimFlushLocked()
 }
@@ -258,6 +273,8 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 	if zeroCopy {
 		w.chunks = append(w.chunks, chunk{ref: payload})
 	}
+	w.frames++
+	w.payload += uint64(len(payload))
 	w.pending += total
 
 	mySeq := w.seq
@@ -277,7 +294,7 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 	// deadline case here: a stream with an active write deadline took the
 	// copy path above.
 	w.mu.Lock()
-	for w.doneSeq < mySeq && w.err == nil {
+	for w.doneSeq <= mySeq && w.err == nil {
 		w.waiters++
 		ch := w.flushed
 		w.mu.Unlock()
@@ -313,11 +330,15 @@ func (w *writer) admissionBlockedLocked(st *NativeStream, total int) bool {
 	// saturating bulk writers until the runtime's mutex starvation mode
 	// forces a handoff — which showed up as a millisecond of added tail
 	// latency, an order of magnitude worse than the batch itself.
-	cap := w.s.cfg.MaxBatchBytes
+	limit := w.s.cfg.MaxBatchBytes
 	if total > zeroCopyThreshold {
-		cap -= smallWriteReserve
+		// Never reserve so much that bulk cannot batch at all: a small
+		// MaxBatchBytes (permitted down to one max frame) minus a fixed
+		// reserve goes negative, which would block every bulk write behind
+		// a full drain and reduce group commit to one frame per syscall.
+		limit = max(limit-smallWriteReserve, int(w.s.cfg.MaxFrameSize)+frame.HeaderSize)
 	}
-	if w.pending+total > cap {
+	if w.pending+total > limit {
 		return true
 	}
 	return st.batchSeq == w.seq+1 && st.batchBytes+total > w.s.cfg.PerStreamBatchBytes
@@ -362,13 +383,15 @@ func (w *writer) flushLoop() {
 		w.fstage, w.stage = w.stage, w.fstage[:0]
 		w.fchunks, w.chunks = w.chunks, w.fchunks[:0]
 		w.fpingStamp, w.pingStamp = w.pingStamp, false
+		w.fframes, w.frames = w.frames, 0
+		w.fpayload, w.payload = w.payload, 0
 		w.pending = 0
 		w.mu.Unlock()
 
 		err := w.writeOut()
 
 		w.mu.Lock()
-		w.doneSeq = seq
+		w.doneSeq = seq + 1 // batches completed, not last completed seq
 		if err != nil && w.err == nil {
 			w.err = err
 		}
@@ -422,17 +445,7 @@ func (w *writer) writeOut() error {
 	if len(w.iov) == 0 {
 		return nil
 	}
-	// Frames per flush is the ratio that says whether batching is working;
-	// counted here, where a batch is fully assembled.
-	var frames, bytes uint64
-	for _, b := range w.iov {
-		bytes += uint64(len(b))
-	}
-	frames = uint64(len(w.fchunks))
-	if len(w.fctl) > 0 {
-		frames++
-	}
-	w.s.stats.recordFlush(frames, bytes)
+	w.s.stats.recordFlush(w.fframes, w.fpayload)
 
 	if w.s.cfg.WriteTimeout > 0 {
 		_ = w.s.conn.SetWriteDeadline(time.Now().Add(w.s.cfg.WriteTimeout))
