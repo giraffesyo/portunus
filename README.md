@@ -129,4 +129,4 @@ cd bench && go test -bench=. .       # vs tuned yamux
 
 ## License
 
-TBD.
+MIT. See [LICENSE](LICENSE).
