@@ -65,17 +65,14 @@ type NativeSession struct {
 	readDone  chan struct{}
 }
 
-// Client starts a session on the dialing side (odd stream IDs).
-//
-// It writes the SETTINGS handshake before returning, which any buffered
-// carrier absorbs immediately. On a synchronous carrier such as net.Pipe the
-// peer must already be reading, or the call blocks until WriteTimeout.
+// Client starts a session on the dialing side (odd stream IDs). It takes
+// ownership of conn: closing the session closes the carrier.
 func Client(conn net.Conn, cfg *Config) (*NativeSession, error) {
 	return newSession(conn, cfg, true)
 }
 
-// Server starts a session on the accepting side (even stream IDs). It writes
-// the SETTINGS handshake before returning; see Client.
+// Server starts a session on the accepting side (even stream IDs). It takes
+// ownership of conn; see Client.
 func Server(conn net.Conn, cfg *Config) (*NativeSession, error) {
 	return newSession(conn, cfg, false)
 }
@@ -118,10 +115,18 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 		_ = applyNotSentLowat(conn, c.NotSentLowat)
 	}
 
+	// The reader starts before the handshake is written. Nothing requires
+	// us to send first, and writing first deadlocks two sessions on any
+	// carrier that does not buffer — over net.Pipe both peers block in
+	// their SETTINGS write with neither yet reading. Frames that arrive
+	// before our own SETTINGS reach the wire are handled normally: our
+	// configuration is already in place, and SETTINGS only describes what
+	// we accept.
+	go s.readLoop()
 	if err := s.sendSettings(); err != nil {
+		s.fatal(&SessionError{Code: CodeInternal, Reason: "sending SETTINGS: " + err.Error()})
 		return nil, err
 	}
-	go s.readLoop()
 	if c.KeepaliveInterval > 0 {
 		go s.keepaliveLoop()
 	}

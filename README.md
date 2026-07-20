@@ -4,9 +4,9 @@ A stream multiplexer for Go: many logical streams over one reliable
 byte-stream carrier (TCP, TLS, a Unix socket, an SSH channel — anything
 satisfying `net.Conn`).
 
-**Status: in development, not yet released.** The protocol, the core, the
-performance machinery, and the QUIC adapter are built and tested; the
-hardening pass is not. See [DESIGN.md](DESIGN.md) for the architecture and
+**Status: feature-complete, not yet released.** Everything through the
+hardening pass is built and tested; the version has not been tagged and the
+API may still move. See [DESIGN.md](DESIGN.md) for the architecture and
 [bench/BASELINE.md](bench/BASELINE.md) for measured numbers, including what
 does not yet win.
 
@@ -66,6 +66,29 @@ Targets are ≥2× single-stream bulk, ≥4× many-stream small messages, and ze
 amortized allocations per frame at steady state — each one gated by a
 benchmark against tuned (not default) baselines.
 
+## Choosing a transport
+
+| You need | Use |
+|---|---|
+| Streams over an existing byte stream (TCP, TLS, a Unix socket, an SSH channel) | `mux.Client` / `mux.Server` |
+| No head-of-line blocking, and UDP reaches your peer | `adapters/quic` |
+| An on-path L7 proxy to understand your traffic | HTTP/2 or WebSocket, not this |
+
+The first two are the same API — the `Session` and `Stream` interfaces, with
+a shared conformance suite run against both — so code can be written once and
+the transport chosen at the edges.
+
+The third is a real limitation, not a hedge. A custom binary wire format is
+safe precisely *because* nothing on the path parses it: it rides under TLS as
+opaque bytes. That is also why nothing on the path can route, inspect, or
+load-balance it. Kubernetes moved its streaming from SPDY to WebSockets for
+exactly this reason. If a proxy in the middle has to terminate and understand
+your protocol, use one it already speaks.
+
+Where UDP is blocked but you still want QUIC semantics, this library over a
+TLS carrier is the pragmatic answer — the stream API is deliberately the same
+shape, so the migration is a constructor change.
+
 ## What's honest about it
 
 - **TCP head-of-line blocking is not solved.** One lost packet stalls every
@@ -90,7 +113,7 @@ benchmark against tuned (not default) baselines.
 | M5 | BDP-autotuned flow control, keepalive | done |
 | M6 | Performance targets, socket tuning, mixed-workload fairness | done |
 | M7 | QUIC adapter (`adapters/quic`) + shared conformance suite | done |
-| M8 | Fuzzing, soak, hardening, docs | planned |
+| M8 | Fuzzing, soak, hardening, docs | done |
 
 ## Development
 
