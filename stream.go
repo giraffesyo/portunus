@@ -98,6 +98,7 @@ func releaseAll(segs []segment) {
 }
 
 func newStream(sess *NativeSession, id uint32, local bool) *NativeStream {
+	sess.budget.reserve(uint64(sess.cfg.InitialWindow))
 	return &NativeStream{
 		sess:      sess,
 		id:        id,
@@ -183,15 +184,22 @@ func (s *NativeStream) Read(p []byte) (int, error) {
 // maybeGrowRecvLimitLocked returns a new absolute limit to advertise, or 0.
 // The trigger (less than half a window of headroom) guarantees the new limit
 // strictly exceeds the previous one, so the peer never sees a no-op update.
+//
+// It is also where autotuning lands: the window is resized to the session's
+// current BDP estimate, clamped by the session receive budget, at the moment
+// we would have sent an update anyway. Growth costs no extra frame.
 func (s *NativeStream) maybeGrowRecvLimitLocked() uint64 {
 	if s.finRecvd || s.readErr != nil || s.readClosed {
 		return 0
 	}
-	if s.recvLimit-s.consumed < s.window/2 {
-		s.recvLimit = s.consumed + s.window
-		return s.recvLimit
+	if s.recvLimit-s.consumed >= s.window/2 {
+		return 0
 	}
-	return 0
+	if target := s.sess.bdp.target(); target > s.window {
+		s.window = s.sess.budget.grow(s.window, target)
+	}
+	s.recvLimit = s.consumed + s.window
+	return s.recvLimit
 }
 
 // WriteTo implements io.WriterTo: it hands received segments straight to dst

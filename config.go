@@ -17,6 +17,28 @@ type Config struct {
 	// peer overrun us. Default 256KB.
 	InitialWindow uint32
 
+	// MaxWindow caps how far BDP autotuning may grow a single stream's
+	// receive window. A window of at least bandwidth × RTT is what keeps a
+	// long path from capping at window/RTT. Default 16MB.
+	MaxWindow uint32
+
+	// MaxReceiveBudget bounds the total receive credit outstanding across
+	// the session, so autotuning cannot turn many briefly-fast streams into
+	// an OOM. It only ever declines to grow a window; granted credit is
+	// never revoked. Default 128MB.
+	MaxReceiveBudget int
+
+	// KeepaliveInterval is the period between PINGs, which double as the
+	// BDP probe and the liveness check. Zero selects 20s; negative
+	// disables keepalive (and with it, autotuning's RTT samples).
+	KeepaliveInterval time.Duration
+
+	// KeepaliveTimeout declares the peer dead after this much silence on
+	// the receive side — never on our ability to send, since both peers can
+	// be send-stalled at once. Zero selects three intervals; negative
+	// disables the liveness check.
+	KeepaliveTimeout time.Duration
+
 	// MaxFrameSize is the largest DATA payload we accept. Bounds between
 	// frame.FloorMaxFrameSize (16KB) and frame.MaxLength. Default 64KB.
 	MaxFrameSize uint32
@@ -64,6 +86,9 @@ const (
 	defaultWriteTimeout   = 30 * time.Second
 	defaultReadBufferSize = 16 << 10
 	defaultMaxBatchBytes  = 512 << 10
+	defaultMaxWindow      = 16 << 20
+	defaultRecvBudget     = 128 << 20
+	defaultKeepalive      = 20 * time.Second
 )
 
 func buildConfig(in *Config) (Config, error) {
@@ -98,6 +123,27 @@ func buildConfig(in *Config) (Config, error) {
 	if c.PerStreamBatchBytes == 0 {
 		c.PerStreamBatchBytes = c.MaxBatchBytes / 4
 	}
+	if c.MaxWindow == 0 {
+		c.MaxWindow = defaultMaxWindow
+	}
+	if c.MaxWindow < c.InitialWindow {
+		c.MaxWindow = c.InitialWindow
+	}
+	if c.MaxReceiveBudget == 0 {
+		c.MaxReceiveBudget = defaultRecvBudget
+	}
+	switch {
+	case c.KeepaliveInterval == 0:
+		c.KeepaliveInterval = defaultKeepalive
+	case c.KeepaliveInterval < 0:
+		c.KeepaliveInterval = 0
+	}
+	switch {
+	case c.KeepaliveTimeout == 0:
+		c.KeepaliveTimeout = 3 * c.KeepaliveInterval
+	case c.KeepaliveTimeout < 0:
+		c.KeepaliveTimeout = 0
+	}
 
 	if c.InitialWindow < frame.FloorInitialWindow {
 		return c, fmt.Errorf("mux: InitialWindow %d below protocol floor %d", c.InitialWindow, frame.FloorInitialWindow)
@@ -121,6 +167,13 @@ func buildConfig(in *Config) (Config, error) {
 	// could never make progress.
 	if c.PerStreamBatchBytes < minBatch {
 		c.PerStreamBatchBytes = minBatch
+	}
+	// A liveness timeout at or below the probe interval would declare a
+	// healthy peer dead between probes — the incoherent-defaults bug that
+	// has bitten several tunnel projects.
+	if c.KeepaliveInterval > 0 && c.KeepaliveTimeout > 0 && c.KeepaliveTimeout <= c.KeepaliveInterval {
+		return c, fmt.Errorf("mux: KeepaliveTimeout %v must exceed KeepaliveInterval %v",
+			c.KeepaliveTimeout, c.KeepaliveInterval)
 	}
 	return c, nil
 }

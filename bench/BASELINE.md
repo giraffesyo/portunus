@@ -5,6 +5,45 @@ yamux at its 16MB max window with keepalive off, mux at the same 16MB window.
 Comparing our default window against yamux's tuned one measures configuration,
 not implementation — see "A note on windows" below.
 
+## After M5 (BDP autotune, keepalive)
+
+Loopback numbers are unchanged from M4 — autotuning costs nothing when the
+window is already large enough:
+
+| Benchmark | mux | yamux | ratio |
+|---|---|---|---|
+| Bulk 64KB writes | 11883 MB/s | 6497 MB/s | 1.83× ahead |
+| Small msgs, 64 streams | 248.9 ns/op | 4910 ns/op | 19.7× ahead |
+| Relay | 7845 MB/s | 2724 MB/s | 2.88× ahead |
+| Echo RTT 64B | 24.1 µs | 26.9 µs | 1.12× ahead |
+
+### WAN profile (200ms RTT) — autotuning works, but does not yet win
+
+| Benchmark | throughput |
+|---|---|
+| mux, autotuning from a 64KB floor | 1.55 MB/s |
+| yamux, 256KB default window | 1.31 MB/s |
+| yamux, hand-tuned 16MB window | 19.8 MB/s |
+
+**This is an open problem, not a win.** Autotuning does what it claims —
+`TestBDPWindowGrowsOnHighLatencyPath` proves the window grows and the RTT
+estimate is accurate to within a millisecond of the injected 200ms — and it
+beats the out-of-the-box yamux configuration that real tunnels actually run.
+But a hand-tuned static window still beats it by an order of magnitude,
+because the climb from 64KB to a full BDP takes one doubling per round trip
+and the benchmark is not long enough to amortize that ramp.
+
+The harness is also a poor model and its absolute numbers should not be
+trusted: `net.Pipe` plus a delay queue has no bandwidth limit, so results are
+dominated by chunk granularity rather than by the protocol. The design's
+stated gate is a netem-shaped stage on Linux CI, which this machine (macOS)
+cannot run. Treat the WAN row as directional only.
+
+Two candidate fixes for M6: start the climb from a larger initial window when
+the measured RTT is high (a 200ms path justifies a big window immediately),
+and allow more than one doubling per RTT while the sender is continuously
+stalling.
+
 ## After M4 (segment pools, zero-copy relay)
 
 | Benchmark | mux | yamux | ratio |

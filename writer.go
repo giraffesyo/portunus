@@ -77,6 +77,11 @@ type writer struct {
 
 	flushing bool
 
+	// pingStamp marks a batch as carrying the BDP probe, so the flusher can
+	// timestamp it as it reaches the carrier rather than at enqueue.
+	pingStamp  bool
+	fpingStamp bool
+
 	// Flusher-owned scratch, swapped with the pending buffers so neither
 	// side allocates in steady state.
 	fctl     []byte
@@ -125,14 +130,40 @@ func (w *writer) appendControlAsync(h frame.Header, payload []byte) {
 	}
 }
 
+// appendProbe queues the BDP probe PING and marks its batch for flush-time
+// stamping, so the measured RTT excludes our own queue delay.
+//
+// The flag is set in the same critical section as the append. Setting it
+// separately lets a flush in between carry the flag away on a batch that
+// does not contain the probe: the probe then reaches the wire unstamped and
+// its sample is discarded, which stalls autotuning at the initial window.
+func (w *writer) appendProbe(h frame.Header, payload []byte) {
+	if w.stageControlStamped(h, payload) {
+		go w.flushLoop()
+	}
+}
+
 // stageControl appends the frame and reports whether the caller took
 // ownership of flushing. Control frames never wait on the batch cap: they
 // are small, bounded, and some originate on the reader goroutine.
 func (w *writer) stageControl(h frame.Header, payload []byte) bool {
+	return w.stage2(h, payload, false)
+}
+
+// stageControlStamped is stageControl plus marking the batch as carrying the
+// BDP probe, both under one lock.
+func (w *writer) stageControlStamped(h frame.Header, payload []byte) bool {
+	return w.stage2(h, payload, true)
+}
+
+func (w *writer) stage2(h frame.Header, payload []byte, stamp bool) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.err != nil {
 		return false
+	}
+	if stamp {
+		w.pingStamp = true
 	}
 	h.Length = uint32(len(payload))
 	var hdr [frame.HeaderSize]byte
@@ -310,6 +341,7 @@ func (w *writer) flushLoop() {
 		w.fctl, w.ctl = w.ctl, w.fctl[:0]
 		w.fstage, w.stage = w.stage, w.fstage[:0]
 		w.fchunks, w.chunks = w.chunks, w.fchunks[:0]
+		w.fpingStamp, w.pingStamp = w.pingStamp, false
 		w.pending = 0
 		w.mu.Unlock()
 
@@ -374,6 +406,13 @@ func (w *writer) writeOut() error {
 	if w.s.cfg.WriteTimeout > 0 {
 		_ = w.s.conn.SetWriteDeadline(time.Now().Add(w.s.cfg.WriteTimeout))
 		defer func() { _ = w.s.conn.SetWriteDeadline(time.Time{}) }()
+	}
+
+	if w.fpingStamp {
+		// Stamped here, immediately before the syscall: any time this
+		// batch spent queued is ours, not the network's.
+		w.s.bdp.markSent(time.Now(), w.s.recvTotal.Load(), w.s.stalls.Load())
+		w.fpingStamp = false
 	}
 
 	if w.tcp != nil {

@@ -312,17 +312,27 @@ portable fallback — an experiment, not a v1 promise.
   carrier write time by the flusher — never at enqueue, or queue delay
   inflates measured RTT and the estimator grows windows *because* the
   session is loaded: a bufferbloat spiral bounded only by `MaxWindow`. The
-  estimator uses a min-filtered RTT and caps growth per RTT — the gRPC
-  estimator's discipline, not just its trigger. The sampling mechanism is
-  specified, not implied: **receiver-driven** — count bytes delivered
-  between a flusher-timestamped PING and its ACK (that count *is* the BDP
-  sample; RTT alone sets no window target), and gate growth on a
-  bandwidth-sample plateau (grow only when the sample approaches the
-  current window *and* measured bandwidth equals the max observed — the
-  gate that actually rejects queue-inflated samples). The M5 fuzz/soak
-  matrix includes window growth racing FIN/RST/GOAWAY: dynamic windows
-  have caused correctness bugs, not just tuning bugs (grpc-go's
-  ~150ms-link "unexpected EOF" race, grpc-go#5358).
+  byte counter starts at the same instant for the same reason: bytes
+  already in flight before the probe hit the wire were not caused by it.
+  RTT is min-filtered, growth is capped at a doubling per RTT, and the
+  probe threshold scales with the current estimate so probing settles at
+  roughly one sample per round trip (a fixed threshold costs a control
+  flush per data frame).
+- **Growth is triggered by a measured flow-control stall**, not by
+  comparing the arrival rate against the estimate. A receiver knows
+  directly when a sender has consumed nearly all its granted credit, and
+  that is the only evidence that a larger window would help. Rate-based
+  triggers are circular here and were tried and rejected during M5: a
+  window too small to fill the pipe makes the sender stall waiting for
+  credit, which lowers the arrival rate, which fails the
+  sample-versus-estimate test, which keeps the window small. Both the
+  gRPC-style bandwidth-plateau test and a tight RTT bound pinned the
+  window at its initial size indefinitely on a 200ms path. Delay is kept
+  as the brake — growth stops when RTT exceeds twice the minimum — so a
+  genuinely congested path still halts the climb.
+- The M5 fuzz/soak matrix includes window growth racing FIN/RST/GOAWAY:
+  dynamic windows have caused correctness bugs, not just tuning bugs
+  (grpc-go's ~150ms-link "unexpected EOF" race, grpc-go#5358).
 - **No connection-level window on the wire, but a session receive budget in
   the implementation.** Autotune exists to push windows toward `MaxWindow`,
   so the naive bound (`MaxIncomingStreams × MaxWindow`) is gigabytes — an

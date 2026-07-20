@@ -36,6 +36,13 @@ type NativeSession struct {
 
 	w *writer // group-commit send path
 
+	bdp       *bdpEstimator
+	budget    *budget
+	recvTotal atomic.Uint64 // cumulative payload bytes received
+	stalls    atomic.Uint64 // times a sender exhausted its granted credit
+	nextProbe atomic.Uint64 // PING opaque counter
+	lastRecv  atomic.Int64  // UnixNano of the last frame from the peer
+
 	// ctlScratch is reader-owned: control payloads are parsed immediately
 	// and never retained, so one reusable buffer serves them all.
 	ctlScratch []byte
@@ -88,6 +95,9 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 		readDone: make(chan struct{}),
 	}
 	s.w = newWriter(s)
+	s.bdp = newBDPEstimator(uint64(c.InitialWindow), uint64(c.MaxWindow))
+	s.budget = newBudget(uint64(c.MaxReceiveBudget), uint64(c.MaxWindow))
+	s.lastRecv.Store(time.Now().UnixNano())
 	if client {
 		s.nextID = 1
 	} else {
@@ -108,7 +118,70 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 		return nil, err
 	}
 	go s.readLoop()
+	if c.KeepaliveInterval > 0 {
+		go s.keepaliveLoop()
+	}
 	return s, nil
+}
+
+// keepaliveLoop probes the peer on a jittered interval. The PING doubles as
+// the BDP sample and as the liveness check; liveness is judged on receive-side
+// silence, never on our ability to send, because both peers can be
+// send-stalled at once.
+func (s *NativeSession) keepaliveLoop() {
+	interval := s.cfg.KeepaliveInterval
+	// Deterministic per-session jitter spreads probes across many sessions
+	// without pulling in math/rand.
+	jitter := time.Duration(uint64(time.Now().UnixNano()) % uint64(interval/4))
+	t := time.NewTimer(interval - interval/8 + jitter)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+		}
+		if s.cfg.KeepaliveTimeout > 0 {
+			silent := time.Since(time.Unix(0, s.lastRecv.Load()))
+			if silent > s.cfg.KeepaliveTimeout {
+				s.fatal(&SessionError{
+					Code:   CodeInternal,
+					Reason: "peer silent for " + silent.Round(time.Millisecond).String(),
+				})
+				return
+			}
+		}
+		s.sendProbe()
+		t.Reset(interval - interval/8 + jitter)
+	}
+}
+
+// sendProbe emits a PING that serves as both keepalive and BDP sample.
+func (s *NativeSession) sendProbe() {
+	opaque := s.nextProbe.Add(1)
+	var buf [frame.PingLen]byte
+	payload := frame.AppendPing(buf[:0], opaque)
+	if s.bdp.shouldProbe(s.recvTotal.Load(), opaque) {
+		s.w.appendProbe(frame.Header{Type: frame.TypePing}, payload)
+		return
+	}
+	s.w.appendControlAsync(frame.Header{Type: frame.TypePing}, payload)
+}
+
+// maybeProbe starts a BDP sample from the receive path, so probing is paced
+// by data arrival rather than by the keepalive timer. Because a probe stays
+// in flight for exactly one round trip, this settles at one sample per RTT —
+// the fastest honest cadence, and the one that lets the window converge in a
+// handful of round trips instead of tens of timer ticks.
+func (s *NativeSession) maybeProbe() {
+	opaque := s.nextProbe.Add(1)
+	if !s.bdp.shouldProbe(s.recvTotal.Load(), opaque) {
+		return
+	}
+	var buf [frame.PingLen]byte
+	// Async: this runs on the reader goroutine, which must never block on
+	// the send path.
+	s.w.appendProbe(frame.Header{Type: frame.TypePing}, frame.AppendPing(buf[:0], opaque))
 }
 
 func (s *NativeSession) sendSettings() error {
@@ -239,6 +312,7 @@ func (s *NativeSession) readLoop() {
 			return
 		}
 		h := frame.ParseHeader(hdr[:])
+		s.lastRecv.Store(time.Now().UnixNano())
 		if h.Length > s.cfg.MaxFrameSize && h.Type == frame.TypeData {
 			s.fatalProtocol(CodeFrameSize, "DATA frame exceeds MaxFrameSize")
 			return
@@ -324,13 +398,17 @@ func (s *NativeSession) dispatch(h frame.Header, payload, seg []byte) error {
 			s.fatalProtocol(CodeFrameSize, "malformed PING")
 			return errSessionTerminated
 		}
-		if h.Flags&frame.FlagACK == 0 {
-			// Async: the reader must never block on the send path.
-			var buf [frame.PingLen]byte
-			s.w.appendControlAsync(
-				frame.Header{Type: frame.TypePing, Flags: frame.FlagACK},
-				frame.AppendPing(buf[:0], opaque))
+		if h.Flags&frame.FlagACK != 0 {
+			// Our probe came home: close out the BDP sample. A larger
+			// window target is adopted by streams as they grow.
+			s.bdp.onACK(opaque, s.recvTotal.Load(), s.stalls.Load(), time.Now())
+			return nil
 		}
+		// Async: the reader must never block on the send path.
+		var buf [frame.PingLen]byte
+		s.w.appendControlAsync(
+			frame.Header{Type: frame.TypePing, Flags: frame.FlagACK},
+			frame.AppendPing(buf[:0], opaque))
 		return nil
 
 	case frame.TypeGoAway:
@@ -536,11 +614,19 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload, seg []
 		s.fatalProtocol(CodeProtocol, "DATA after FIN")
 		return errSessionTerminated
 	}
+	s.recvTotal.Add(uint64(len(payload)))
 	st.recvd += uint64(len(payload))
 	if st.recvd > st.recvLimit {
 		st.mu.Unlock()
 		s.fatalProtocol(CodeFlowControl, "peer exceeded stream window")
 		return errSessionTerminated
+	}
+	// A sender with less than a frame of credit left is window-limited: it
+	// cannot send a full frame without waiting for us. That is the signal
+	// autotuning grows on. Testing for exactly zero credit would almost
+	// never fire, since the limit is not frame-aligned.
+	if st.recvLimit-st.recvd < uint64(s.cfg.MaxFrameSize) {
+		s.stalls.Add(1)
 	}
 	drop := st.readClosed || st.readErr != nil
 	if !drop && len(payload) > 0 {
@@ -561,6 +647,9 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload, seg []
 	notify(st.readable)
 	if limit > 0 {
 		s.sendWindowUpdate(st, limit)
+	}
+	if len(payload) > 0 {
+		s.maybeProbe()
 	}
 	s.maybeRemove(st)
 	return nil
@@ -624,13 +713,21 @@ func (s *NativeSession) maybeRemove(st *NativeStream) {
 	st.mu.Unlock()
 
 	s.mu.Lock()
-	if _, ok := s.streams[st.id]; ok {
+	_, ok := s.streams[st.id]
+	if ok {
 		delete(s.streams, st.id)
 		if !st.local {
 			s.incoming--
 		}
 	}
 	s.mu.Unlock()
+
+	if ok {
+		st.mu.Lock()
+		window := st.window
+		st.mu.Unlock()
+		s.budget.release(window)
+	}
 }
 
 func (s *NativeSession) handleGoAway(lastID uint32, code uint64, reason string) {
