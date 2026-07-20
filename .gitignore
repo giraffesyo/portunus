@@ -1,0 +1,8 @@
+# Local-only notes with deployment-specific context — never committed
+/PRIVATE.md
+
+# Go artifacts
+*.test
+*.prof
+*.out
+coverage.html

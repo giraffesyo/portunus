@@ -1,0 +1,93 @@
+# mux
+
+A stream multiplexer for Go: many logical streams over one reliable
+byte-stream carrier (TCP, TLS, a Unix socket, an SSH channel — anything
+satisfying `net.Conn`).
+
+**Status: in development.** The wire format and the correct core are done and
+tested; the performance machinery is not yet built. See
+[DESIGN.md](DESIGN.md) for the full architecture and
+[bench/BASELINE.md](bench/BASELINE.md) for where performance stands today.
+
+- **Zero dependencies** outside the standard library, forever. Benchmarks and
+  the QUIC adapter live in separate modules so `go get` stays clean.
+- **Streams are `net.Conn`s**, so they drop into existing code — plus the
+  QUIC-shaped controls `net.Conn` lacks: half-close, and read/write
+  cancellation carrying an application error code.
+- **Zero-syscall stream open**: `OpenStream` is purely local; a stream
+  announces itself on its first frame.
+
+```go
+sess, err := mux.Client(conn, nil)
+st, err := sess.OpenStream(ctx)
+
+st.Write(request)
+st.CloseWrite()              // peer sees EOF; we can still read the reply
+io.Copy(os.Stdout, st)
+```
+
+Server side:
+
+```go
+sess, err := mux.Server(conn, nil)
+for {
+    st, err := sess.AcceptStream(ctx)
+    if err != nil {
+        return err
+    }
+    go handle(st)            // st is a net.Conn
+}
+```
+
+## Why another multiplexer
+
+yamux is the incumbent and it is beatable on structure, not micro-tuning: it
+does a channel round-trip and an allocation per frame, two syscalls per data
+frame with no cross-stream batching, a copy into a growing `bytes.Buffer` on
+receive, and a fixed 256KB window with no BDP awareness. On a 200ms path that
+last one alone caps a stream near 1.3 MB/s regardless of how fast the link is.
+
+This library targets those four things directly: group-commit batching into a
+single `writev` across streams, pooled segments with a zero-copy relay path,
+wakeup and allocation elimination on the hot paths, and BDP-autotuned windows.
+Targets are ≥2× single-stream bulk, ≥4× many-stream small messages, and zero
+amortized allocations per frame at steady state — each one gated by a
+benchmark against tuned (not default) baselines.
+
+## What's honest about it
+
+- **TCP head-of-line blocking is not solved.** One lost packet stalls every
+  stream on the carrier. That is physics, and it is QUIC's genuine advantage;
+  no userspace mux fixes it. The QUIC adapter exists for when you need that.
+- **A session's receive side is one goroutine**, so it is bounded by one
+  core's parse-and-copy throughput. Run multiple sessions to scale past it.
+- **The wire format is clean-slate**, so both ends must run this library. It
+  is not yamux-compatible and never will be.
+- Prefer HTTP/2 or WebSocket when an on-path L7 proxy has to parse your
+  traffic. A custom binary mux is safe precisely because nothing on-path
+  parses it — which is also why nothing on-path can route it.
+
+## Status by milestone
+
+| Milestone | What | State |
+|-----------|------|-------|
+| M1 | Wire format, frame codec, fuzz targets | done |
+| M2 | Correct core: lifecycle, flow control, receiver rules, tests | done |
+| M3 | Group commit: batched writev send path | next |
+| M4 | Receive fast paths: segment pools, zero-copy relay | planned |
+| M5 | BDP-autotuned flow control | planned |
+| M6 | Hit the performance targets | planned |
+| M7 | QUIC adapter (`adapters/quic`) | planned |
+| M8 | Fuzzing, soak, hardening, docs | planned |
+
+## Development
+
+```bash
+go test -race ./...                  # correctness, race-clean
+go test ./internal/frame -fuzz=Fuzz  # wire-format fuzzing
+cd bench && go test -bench=. .       # vs tuned yamux
+```
+
+## License
+
+TBD.
