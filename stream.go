@@ -78,6 +78,11 @@ type NativeStream struct {
 	// wdSet reports whether a write deadline is currently armed, read on
 	// the send hot path to choose the copy path over zero copy.
 	wdSet atomic.Bool
+
+	// lastActive is the UnixNano of the most recent payload in either
+	// direction, for the optional idle sweep. Atomic so the sweep never
+	// takes a stream lock.
+	lastActive atomic.Int64
 }
 
 // hasWriteDeadline reports whether this stream's writes must be copied
@@ -104,7 +109,7 @@ func releaseAll(segs []segment) {
 
 func newStream(sess *NativeSession, id uint32, local bool) *NativeStream {
 	sess.budget.reserve(uint64(sess.cfg.InitialWindow))
-	return &NativeStream{
+	st := &NativeStream{
 		sess:      sess,
 		id:        id,
 		local:     local,
@@ -116,6 +121,8 @@ func newStream(sess *NativeSession, id uint32, local bool) *NativeStream {
 		rd:        makeDeadline(),
 		wd:        makeDeadline(),
 	}
+	st.lastActive.Store(time.Now().UnixNano())
+	return st
 }
 
 // StreamID returns the wire stream ID (uint64 so QUIC's 62-bit IDs fit the
@@ -350,6 +357,7 @@ func (s *NativeStream) Write(p []byte) (int, error) {
 		}
 		s.sent += uint64(n)
 		s.mu.Unlock()
+		s.lastActive.Store(time.Now().UnixNano())
 
 		// A stream with an active write deadline takes the copy path: the
 		// deadline could not be honored once the caller's buffer is

@@ -203,6 +203,7 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 		}
 		// Registered before unlocking, so the flusher cannot decide
 		// "nobody is waiting" and skip the wakeup we are about to await.
+		w.s.stats.admissionWaits.Add(1)
 		w.waiters++
 		ch := w.flushed
 		w.mu.Unlock()
@@ -341,6 +342,9 @@ func (w *writer) claimFlushLocked() bool {
 // Flusher duty is unconditional: this returns only with the batch drained or
 // the session failed, never leaving a non-empty batch with no flusher.
 func (w *writer) flushLoop() {
+	// Like the reader, this goroutine must not take the host application
+	// down with it: a panic here becomes a session failure, not a crash.
+	defer w.s.recoverPanic("session flusher")
 	for {
 		w.mu.Lock()
 		if w.pending == 0 || w.err != nil {
@@ -418,6 +422,17 @@ func (w *writer) writeOut() error {
 	if len(w.iov) == 0 {
 		return nil
 	}
+	// Frames per flush is the ratio that says whether batching is working;
+	// counted here, where a batch is fully assembled.
+	var frames, bytes uint64
+	for _, b := range w.iov {
+		bytes += uint64(len(b))
+	}
+	frames = uint64(len(w.fchunks))
+	if len(w.fctl) > 0 {
+		frames++
+	}
+	w.s.stats.recordFlush(frames, bytes)
 
 	if w.s.cfg.WriteTimeout > 0 {
 		_ = w.s.conn.SetWriteDeadline(time.Now().Add(w.s.cfg.WriteTimeout))

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -46,6 +47,14 @@ type NativeSession struct {
 	// ctlScratch is reader-owned: control payloads are parsed immediately
 	// and never retained, so one reusable buffer serves them all.
 	ctlScratch []byte
+
+	stats sessionStats
+
+	// Abuse limiters for the frame types that cost work while consuming
+	// little or no flow-control credit. See abuse.go.
+	pingLimit  *rateLimiter
+	resetLimit *rateLimiter
+	noopLimit  *rateLimiter
 
 	mu       sync.Mutex // guards the fields below
 	streams  map[uint32]*NativeStream
@@ -94,7 +103,9 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 	s.w = newWriter(s)
 	s.bdp = newBDPEstimator(uint64(c.InitialWindow), uint64(c.MaxWindow))
 	s.budget = newBudget(uint64(c.MaxReceiveBudget), uint64(c.MaxWindow))
-	s.lastRecv.Store(time.Now().UnixNano())
+	now := time.Now()
+	s.lastRecv.Store(now.UnixNano())
+	s.initAbuseLimits(now)
 	if client {
 		s.nextID = 1
 	} else {
@@ -160,8 +171,40 @@ func (s *NativeSession) keepaliveLoop() {
 				return
 			}
 		}
+		s.sweepIdleStreams()
 		s.sendProbe()
 		t.Reset(interval - interval/8 + jitter)
+	}
+}
+
+// sweepIdleStreams resets streams that have carried nothing for longer than
+// StreamIdleTimeout. It piggybacks on the keepalive tick rather than arming a
+// timer per stream, which would cost more than the streams it reaps.
+func (s *NativeSession) sweepIdleStreams() {
+	if s.cfg.StreamIdleTimeout <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-s.cfg.StreamIdleTimeout).UnixNano()
+
+	s.mu.Lock()
+	var idle []*NativeStream
+	for _, st := range s.streams {
+		if st.lastActive.Load() < cutoff {
+			idle = append(idle, st)
+		}
+	}
+	s.mu.Unlock()
+
+	// Reset outside the session lock: cancelling takes stream locks and
+	// stages control frames.
+	for _, st := range idle {
+		s.stats.streamsReaped.Add(1)
+		st.CancelWrite(CodeCanceled)
+		st.CancelRead(CodeCanceled)
+		st.mu.Lock()
+		st.appClosed = true
+		st.mu.Unlock()
+		s.maybeRemove(st)
 	}
 }
 
@@ -199,6 +242,7 @@ func (s *NativeSession) sendSettings() error {
 		{ID: frame.SettingInitialWindow, Value: uint64(s.cfg.InitialWindow)},
 		{ID: frame.SettingMaxFrameSize, Value: uint64(s.cfg.MaxFrameSize)},
 		{ID: frame.SettingMaxConcurrentStreams, Value: uint64(s.cfg.MaxIncomingStreams)},
+		{ID: frame.SettingPingMinInterval, Value: s.pingMinInterval()},
 	}
 	payload, err := frame.AppendSettings(nil, settings)
 	if err != nil {
@@ -283,6 +327,7 @@ func (s *NativeSession) openStream(ctx context.Context) (*NativeStream, error) {
 	s.lastLoc = id
 	st := newStream(s, id, true)
 	s.streams[id] = st
+	s.stats.streamsOpened.Add(1)
 	return st, nil
 }
 
@@ -313,6 +358,12 @@ func (s *NativeSession) AcceptStream(ctx context.Context) (Stream, error) {
 // resource and never parks holding a stream lock.
 func (s *NativeSession) readLoop() {
 	defer close(s.readDone)
+	// A panic here would otherwise take down the host application: this
+	// goroutine parses peer-controlled input, so any latent bug reachable
+	// from the wire becomes a process crash for whoever imported the
+	// library. Containing it to the session is the difference between one
+	// broken connection and an outage.
+	defer s.recoverPanic("session reader")
 	br := bufio.NewReaderSize(s.conn, s.cfg.ReadBufferSize)
 	var hdr [frame.HeaderSize]byte
 	for {
@@ -322,6 +373,7 @@ func (s *NativeSession) readLoop() {
 		}
 		h := frame.ParseHeader(hdr[:])
 		s.lastRecv.Store(time.Now().UnixNano())
+		s.stats.framesReceived.Add(1)
 		if h.Length > s.cfg.MaxFrameSize && h.Type == frame.TypeData {
 			s.fatalProtocol(CodeFrameSize, "DATA frame exceeds MaxFrameSize")
 			return
@@ -360,6 +412,21 @@ func (s *NativeSession) readLoop() {
 			return // dispatch already terminated the session
 		}
 	}
+}
+
+// recoverPanic converts a panic in a library-owned goroutine into a session
+// failure. The panic is not swallowed silently — it is reported as the
+// session's error, with the goroutine named, so it surfaces to the
+// application through the same channel as any other fatal condition.
+func (s *NativeSession) recoverPanic(where string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	s.fatal(&SessionError{
+		Code:   CodeInternal,
+		Reason: fmt.Sprintf("panic in %s: %v", where, r),
+	})
 }
 
 func (s *NativeSession) readEnded(err error) {
@@ -412,6 +479,11 @@ func (s *NativeSession) dispatch(h frame.Header, payload, seg []byte) error {
 			// window target is adopted by streams as they grow.
 			s.bdp.onACK(opaque, s.recvTotal.Load(), s.stalls.Load(), time.Now())
 			return nil
+		}
+		// Every inbound PING obliges us to echo it. Unpoliced, that is a
+		// free amplifier for the peer.
+		if !s.pingLimit.allow(time.Now()) {
+			return s.tooMuch("ping flood")
 		}
 		// Async: the reader must never block on the send path.
 		var buf [frame.PingLen]byte
@@ -544,6 +616,7 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload, seg []byte) erro
 			// No state is created for a refused stream; the payload is
 			// dropped and never counted against any budget. Async: this
 			// runs on the reader goroutine.
+			s.stats.streamsRefused.Add(1)
 			var buf [frame.RSTLen]byte
 			s.w.appendControlAsync(
 				frame.Header{Type: frame.TypeRST, StreamID: h.StreamID},
@@ -558,6 +631,7 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload, seg []byte) erro
 		s.streams[h.StreamID] = st
 		s.incoming++
 		s.mu.Unlock()
+		s.stats.streamsAccepted.Add(1)
 		s.accept <- st
 
 	case isRemote && h.StreamID <= s.maxSeen:
@@ -595,12 +669,20 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload, seg []byte) erro
 			s.fatalProtocol(CodeFrameSize, "malformed RST")
 			return errSessionTerminated
 		}
+		// Reset churn is the Rapid Reset shape: each reset frees the
+		// peer's obligations while leaving us the teardown work.
+		if !s.resetLimit.allow(time.Now()) {
+			return s.tooMuch("stream reset flood")
+		}
 		s.onRST(st, code)
 	case frame.TypeStopSending:
 		code, err := frame.ParseStopSending(payload)
 		if err != nil {
 			s.fatalProtocol(CodeFrameSize, "malformed STOP_SENDING")
 			return errSessionTerminated
+		}
+		if !s.resetLimit.allow(time.Now()) {
+			return s.tooMuch("stream reset flood")
 		}
 		s.onStopSending(st, code)
 	}
@@ -623,7 +705,21 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload, seg []
 		s.fatalProtocol(CodeProtocol, "DATA after FIN")
 		return errSessionTerminated
 	}
+	if len(payload) == 0 && h.Flags == 0 {
+		// Carries nothing, opens nothing, closes nothing — pure parse and
+		// dispatch cost, and it consumes no flow-control credit, so no
+		// byte budget will ever notice it.
+		st.mu.Unlock()
+		if !s.noopLimit.allow(time.Now()) {
+			return s.tooMuch("empty frame flood")
+		}
+		st.mu.Lock()
+	}
+	if len(payload) > 0 {
+		st.lastActive.Store(time.Now().UnixNano())
+	}
 	s.recvTotal.Add(uint64(len(payload)))
+	s.stats.bytesReceived.Add(uint64(len(payload)))
 	st.recvd += uint64(len(payload))
 	if st.recvd > st.recvLimit {
 		st.mu.Unlock()
@@ -636,6 +732,7 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload, seg []
 	// never fire, since the limit is not frame-aligned.
 	if st.recvLimit-st.recvd < uint64(s.cfg.MaxFrameSize) {
 		s.stalls.Add(1)
+		s.stats.windowStalls.Add(1)
 		st.stalledSinceGrow = true
 	}
 	drop := st.readClosed || st.readErr != nil

@@ -382,3 +382,36 @@ func TestProtocolGoAwayMakesOpenRetriable(t *testing.T) {
 		t.Fatalf("OpenStream after GOAWAY: got %v, want ErrGoAway", err)
 	}
 }
+
+// netPipe and readFrames give tests a raw view of what a session emits.
+func netPipe() (net.Conn, net.Conn) { return net.Pipe() }
+
+type readFrame struct {
+	h frame.Header
+	p []byte
+}
+
+// readFrames decodes frames from conn into a channel, starting immediately so
+// a session's handshake is consumed as it is written.
+func readFrames(t *testing.T, conn net.Conn) <-chan readFrame {
+	t.Helper()
+	ch := make(chan readFrame, 16)
+	go func() {
+		defer close(ch)
+		for {
+			var hdr [frame.HeaderSize]byte
+			if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+				return
+			}
+			h := frame.ParseHeader(hdr[:])
+			p := make([]byte, h.Length)
+			if h.Length > 0 {
+				if _, err := io.ReadFull(conn, p); err != nil {
+					return
+				}
+			}
+			ch <- readFrame{h, p}
+		}
+	}()
+	return ch
+}

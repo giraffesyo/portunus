@@ -48,6 +48,17 @@ type Config struct {
 	// kernel default. Ignored where the option does not exist.
 	NotSentLowat int
 
+	// StreamIdleTimeout resets streams that have carried no data in either
+	// direction for this long. It is off by default: a quiet stream is
+	// normal for a tunnel holding a connection open, and reaping those
+	// would break more than it protects.
+	//
+	// Turn it on for a server facing untrusted peers. Without it, a peer
+	// can open MaxIncomingStreams streams, go silent, and hold every slot
+	// indefinitely — the application cannot tell that apart from a slow
+	// client, so only a timeout can.
+	StreamIdleTimeout time.Duration
+
 	// MaxFrameSize is the largest DATA payload we accept. Bounds between
 	// frame.FloorMaxFrameSize (16KB) and frame.MaxLength. Default 64KB.
 	MaxFrameSize uint32
