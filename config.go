@@ -20,6 +20,14 @@ type Config struct {
 	// MaxWindow caps how far BDP autotuning may grow a single stream's
 	// receive window. A window of at least bandwidth × RTT is what keeps a
 	// long path from capping at window/RTT. Default 16MB.
+	//
+	// Lower it for a session that mixes bulk transfer with latency-sensitive
+	// requests. More credit means more data in flight, and on a link that is
+	// already saturated that surplus buys no throughput while the queue it
+	// permits is paid for by every small request behind it: measured on a
+	// 55ms path, four bulk streams pushed small-request p50 from 48ms at a
+	// 256KB window to 104ms at the autotuned one, for bulk throughput that
+	// was the same either way. See bench/BASELINE.md.
 	MaxWindow uint32
 
 	// MaxReceiveBudget bounds the total receive credit outstanding across

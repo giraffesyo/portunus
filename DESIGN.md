@@ -45,6 +45,17 @@ design diff), with all surviving amendments folded in.
   sessions; the splice relay path bypasses userspace entirely.
 - One carrier means one TCP flow's congestion window. Striping is a v2
   candidate (see SETTINGS reserved bits).
+- Autotuning sizes the window for throughput, and a window sized for
+  throughput is latency a small request pays when it shares the session with a
+  bulk one. Measured on a real 55ms path rather than argued: p50 roughly
+  doubles against a 256KB window, for bulk throughput that is unchanged once
+  the link is the constraint. The knob is Config.MaxWindow; the alternative —
+  making autotuning back off on delay — was rejected because measuring RTT
+  through our own queues is how bufferbloat spirals start.
+- The window has to be grown, and growing costs round trips. A transfer that
+  ends within about five round trips finishes before the window reaches the
+  path's bandwidth-delay product, so a correctly pre-configured peer beats
+  autotuning on short transfers over long paths.
 
 ## Considered and rejected
 

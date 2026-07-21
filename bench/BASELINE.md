@@ -313,6 +313,104 @@ M2 shipped none of the performance machinery: two `conn.Write` calls per DATA
 frame and a fresh allocation per received frame. Stream churn was already
 ahead on structure alone — zero-syscall open versus yamux's synchronous SYN.
 
+## Two machines and a real NIC (the first numbers here that are not loopback)
+
+Every measurement above this line ran both peers in one process, on loopback
+or under netem. Loopback has no driver, no interrupt coalescing, no MTU, no
+segmentation offload, and a round trip roughly forty times shorter than any
+real path. This section is the first that crosses a network interface.
+
+Client on darwin/arm64, server on linux/amd64 in GCP, `GOMAXPROCS=8` pinned on
+both, 55ms round trip, both machines otherwise idle. Six passes over the whole
+matrix, interleaved so every implementation meets the same link conditions
+rather than each one owning its own window of time. The table reports the
+median with the range behind it, because the ranges are wide enough here to
+decide what may honestly be claimed: two configurations whose ranges overlap
+have not been shown to differ. Bare TCP is measured too, since without a
+ceiling there is no way to tell "the library is slow" from "the link is".
+
+A LAN run between two hosts 1.2ms apart was attempted first and discarded: the
+second host turned out to be a CI builder sitting at a load average between 90
+and 175, and at that load the numbers describe the builder. It is recorded
+here so the attempt is not repeated in the belief it was never made.
+
+| scenario | portunus | yamux (default) | yamux (8MB window) | bare TCP |
+|---|---|---|---|---|
+| 4MB, one stream | 5.3 (4.6-5.6) | 3.0 (2.8-3.1) | 7.8 (6.8-8.2) | 9.1 (7.3-10.0) |
+| 64MB, one stream | 19.0 (16.9-19.9) | 3.6 (3.4-3.7) | 19.0 (17.3-20.0) | 25.0 (22.2-26.9) |
+| 8 streams, 8MB each | 24.4 (19.3-26.9) | 19.6 (4.9-20.2) | 23.8 (17.6-27.5) | 26.6 (11.2-36.1) |
+| 64 streams, 1MB each | 22.2 (19.8-25.5) | 24.3 (20.9-29.2) | 22.3 (19.9-25.8) | 21.4 (14.6-23.1) |
+
+Throughput in MB/s. Latency, from the same passes:
+
+| measure | portunus | yamux (default) | yamux (8MB window) | bare TCP |
+|---|---|---|---|---|
+| 64B round trip, p50 | 39.2ms | 39.0ms | - | 39.0ms |
+| under bulk load, p50 | 104ms | 48ms | 41ms | - |
+| under bulk load, p99 | 207ms | 122ms | 381ms | - |
+| under bulk load, requests/s | 8.8 | 17.7 | 7.9 | - |
+| under bulk load, bulk rate | 15.9 MB/s | 15.1 | 15.5 | - |
+
+**Autotuning arrives where hand-tuning would, without the hand.** On the 64MB
+single-stream transfer portunus with no configuration reaches 5.3x stock
+yamux. Against yamux hand-tuned to an 8MB window it is 19.0 against 19.0 —
+identical medians on overlapping ranges. The claim worth making is not that it
+wins but that it ties, having found the window itself. This is the case the
+library was built for, and the one where a fixed default is most obviously
+wrong: yamux's 256KB over a 55ms path cannot exceed 4.7 MB/s no matter how
+fast the link is, and measured 3.6.
+
+**And it charges for that on a short transfer.** The same comparison at 4MB
+inverts: 5.3 against 7.8, ranges 4.6-5.6 and 6.8-8.2, so the gap is real
+rather than noise. The receiver's own counters say why — the window reaches
+2MB on the 4MB transfer and 8MB on the 64MB one. Starting at 256KB and
+doubling once per round trip, 8MB takes five round trips, about 275ms here,
+and a 4MB transfer is over before that completes. Anything sized in
+single-digit megabytes on a long path spends most of its life ramping, and
+pre-configuring the window beats autotuning there.
+
+**Multi-stream is level, not a win.** At eight streams portunus leads on the
+median, 24.4 against 19.6 and 23.8, but the ranges overlap and one yamux pass
+dropped to 4.9; the separation is suggestive and not established. By 64
+streams every implementation including bare TCP sits between 21 and 25: the
+link is saturated and nothing about the multiplexer is visible. Worth noting
+that yamux gains nothing from its larger window once eight streams are open,
+because eight default windows already exceed this path's bandwidth-delay
+product.
+
+**Idle latency is the carrier's, not ours.** A 64-byte round trip costs 39.2ms
+against bare TCP's 39.0ms. On a real path the multiplexer adds nothing
+measurable to an unloaded round trip.
+
+**Latency under load is the honest weakness, and it is the window's fault.**
+Small requests sharing a session with four bulk streams see p50 rise to 104ms
+against 48ms for stock yamux, and the request rate halve, 8.8/s against 17.7.
+Bulk throughput does not pay for it: 15.9 MB/s against 15.1, which on these
+ranges is a tie. On this path, once four streams are running, the link rather
+than the window is the constraint, so the extra credit buys nothing and the
+queue it permits is pure latency.
+
+This is a property of window size rather than of this implementation, which
+the third column establishes: yamux hand-tuned to a comparable window lands in
+the same place — 41ms p50, 7.9 requests/s — and has a distinctly worse tail
+than portunus, 381ms p99 against 207ms. Read the row as "portunus chooses the
+large window automatically and inherits the latency cost that hand-tuning
+yamux would also incur, while handling the tail better than yamux does at that
+size". A deployment mixing bulk transfer with latency-sensitive requests on
+one session should cap MaxWindow rather than accept the autotuned value.
+
+**The window overshoots, and that costs memory rather than throughput.** This
+path's true bandwidth-delay product is about 1MB; the estimator settles at
+8MB and stops, because the utilization test stops being satisfied. The surplus
+credit is never turned into data in flight, since TCP's own congestion control
+remains the binding constraint. Memory stays bounded by MaxReceiveBudget,
+which the 64-stream run confirms: 128MB granted, exactly the cap.
+
+**What this harness cannot measure.** Stream open rate came out at 22.9/s for
+every implementation, which is 1/RTT: the benchmark makes each open wait for a
+reply, so on a 55ms path it measures the path and nothing else. The
+zero-syscall open is a syscall-count property and only shows on loopback.
+
 ## A note on windows
 
 At M4 an experiment showed bulk throughput at 0.50× yamux with mux on its
