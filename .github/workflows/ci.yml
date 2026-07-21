@@ -69,6 +69,35 @@ jobs:
           go get github.com/quic-go/quic-go@latest
           go build ./... && go test -count=1 ./...
 
+  fuzz:
+    name: Protocol fuzzing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Wire format
+        run: go test -run XXX -fuzz=FuzzParseHeader -fuzztime=60s ./internal/frame
+
+      - name: Stream payloads
+        run: go test -run XXX -fuzz=FuzzStreamPayloads -fuzztime=60s .
+
+      - name: Protocol state model
+        # The model checker earns its keep: it asserts delivery, session
+        # survival, credit accounting, and liveness across randomized
+        # interleavings, which is the class of defect input fuzzing cannot
+        # reach and where this package's worst bugs have actually been.
+        run: go test -run XXX -fuzz=FuzzProtocolModel -fuzztime=180s .
+
+      - name: Report any crashers
+        if: failure()
+        run: |
+          echo "::group::failing inputs"
+          find . -path '*/testdata/fuzz/*' -type f -print -exec cat {} \;
+          echo "::endgroup::"
+
   leak-profile:
     name: Goroutine leak profile
     runs-on: ubuntu-latest

@@ -5,6 +5,35 @@ yamux at its 16MB max window with keepalive off, mux at the same 16MB window.
 Comparing our default window against yamux's tuned one measures configuration,
 not implementation — see "A note on windows" below.
 
+## Allocations: the steady-state target is met
+
+| Benchmark | allocs/op | bytes/op |
+|---|---|---|
+| Bulk 64KB writes | **0** | 7 |
+| Small msgs, 64 streams | **0** | 1 |
+| Relay (proxy) | **0** | 86 |
+| Echo RTT | 1 | 48 |
+| Stream open/close | 11 | 1253 |
+
+DESIGN.md's target was zero amortized allocations per frame at steady state,
+and the three data paths that carry frames now hit it exactly. Two escapes
+were responsible for most of what remained, both the same mistake in
+different clothes: taking the address of a local that a pointer-receiver
+method then captures.
+
+- `pool.Put` boxed a local slice to satisfy `sync.Pool`, allocating on every
+  release — in the code whose only job is to avoid allocating.
+- `writeOut` copied the iovec into a local before `WriteTo`, whose pointer
+  receiver made the local escape, allocating on every flush.
+
+Deadline channels were also allocated eagerly for every stream even though
+most streams never set a deadline; they are now created when one is armed.
+Together with the above, churn fell from 19 allocs/op to 11.
+
+The remaining churn cost is 54% stream construction: the struct plus its two
+notify channels, on each side. Recycling those is a design commitment not yet
+taken, deliberately — see the note at the end of this file.
+
 ## WAN profile, kernel-shaped (the result that settles it)
 
 Linux CI, loopback shaped with `tc netem delay 100ms rate 100mbit`, so a
@@ -257,3 +286,24 @@ flow-control budget was. Two conclusions:
 2. A 256KB default is too small for bulk transfer on a fast link, and picking
    a large default instead would waste memory on idle streams. That is the
    argument for BDP autotuning (M5) — the window should find its own size.
+
+
+## Note: why stream objects are not pooled yet
+
+DESIGN.md calls for reusing stream structs with a generation counter so that
+use-after-close is a detectable error rather than pool corruption. It would
+remove roughly half of what stream churn still allocates.
+
+It has not been done, and the reason is risk rather than effort. Recycling an
+object the application still holds a reference to is the classic
+use-after-free hazard, and the mitigation is a generation check on every
+exported method — a dozen places, each one a chance to get it wrong. The
+lifecycle defects this package has actually shipped were all of that flavour:
+a reset overtaking its own SYN, a cancel racing the write that announces a
+stream, credit reserved and never returned. Adding struct recycling is the
+change most likely to add another.
+
+The steady-state target is met without it, and churn at 11 allocs/op is
+already well under yamux's 38. The right time to take this on is with the
+protocol-state fuzzer running long enough to trust it as a net, not while it
+is still new.

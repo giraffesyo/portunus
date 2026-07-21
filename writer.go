@@ -107,6 +107,7 @@ type writer struct {
 	fstage   []byte
 	fchunks  []chunk
 	iov      net.Buffers
+	iovOut   net.Buffers // the copy handed to WriteTo; see writeOut
 	coalesce []byte
 }
 
@@ -533,10 +534,13 @@ func (w *writer) writeOut() error {
 		// WriteTo consumes the Buffers it is given, advancing it as it
 		// writes. Passing w.iov directly leaves it empty but pointing at
 		// the end of its backing array, so the next flush's appends
-		// reallocate — an allocation per flush, which profiling showed
-		// was the single largest remaining allocation source.
-		iov := w.iov
-		_, err := iov.WriteTo(w.tcp)
+		// reallocate.
+		//
+		// The copy lives in a field rather than a local because WriteTo
+		// has a pointer receiver: taking the address of a local makes it
+		// escape, which is an allocation on every flush.
+		w.iovOut = w.iov
+		_, err := w.iovOut.WriteTo(w.tcp)
 		return err
 	}
 

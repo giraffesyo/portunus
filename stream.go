@@ -124,8 +124,6 @@ func newStream(sess *NativeSession, id uint32, local bool) *NativeStream {
 		sendLimit: sess.peerInitialWindow.Load(),
 		readable:  make(chan struct{}, 1),
 		writable:  make(chan struct{}, 1),
-		rd:        makeDeadline(),
-		wd:        makeDeadline(),
 	}
 	st.lastActive.Store(time.Now().UnixNano())
 	return st

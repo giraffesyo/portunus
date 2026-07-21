@@ -8,14 +8,15 @@ import (
 // deadline signals expiry through a channel, modeled on net.Pipe's
 // pipeDeadline: wait() returns a channel that is closed once the deadline
 // passes, and SetDeadline-style updates replace it.
+//
+// The zero value is a stream with no deadline set. Both the timer and the
+// channel are created only when one is actually armed, because most streams
+// never set a deadline and every stream would otherwise pay two channel
+// allocations for the possibility.
 type deadline struct {
 	mu     sync.Mutex
 	timer  *time.Timer
-	cancel chan struct{} // closed when the current deadline has expired
-}
-
-func makeDeadline() deadline {
-	return deadline{cancel: make(chan struct{})}
+	cancel chan struct{} // nil until armed; closed once expired
 }
 
 // set moves the deadline. The zero time clears it.
@@ -28,29 +29,29 @@ func (d *deadline) set(t time.Time) {
 	}
 	d.timer = nil
 
-	closed := isClosedChan(d.cancel)
 	if t.IsZero() {
-		if closed {
+		if isClosedChan(d.cancel) {
 			d.cancel = make(chan struct{})
 		}
 		return
 	}
+	// Arming a real deadline: this is where the channel comes into
+	// existence, and where an expired one is replaced.
+	if d.cancel == nil || isClosedChan(d.cancel) {
+		d.cancel = make(chan struct{})
+	}
 	if dur := time.Until(t); dur > 0 {
-		if closed {
-			d.cancel = make(chan struct{})
-		}
 		cancel := d.cancel
 		d.timer = time.AfterFunc(dur, func() { close(cancel) })
 		return
 	}
-	// Deadline already passed.
-	if !closed {
-		close(d.cancel)
-	}
+	close(d.cancel) // already passed
 }
 
-// wait returns the channel closed on expiry. Callers must re-fetch it after
-// any set() they might race with; stream code fetches it fresh per park.
+// wait returns the channel closed on expiry, or nil when no deadline is set.
+// A nil channel never fires in a select, which is exactly what "no deadline"
+// means. Callers must re-fetch it after any set() they might race with;
+// stream code fetches it fresh per park.
 func (d *deadline) wait() chan struct{} {
 	d.mu.Lock()
 	defer d.mu.Unlock()
