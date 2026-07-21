@@ -159,6 +159,72 @@ func BenchmarkBulkYamux(b *testing.B) {
 	}
 }
 
+// --- bulk writes larger than one frame ---
+//
+// The single-frame case above measures framing overhead; this measures
+// chunking, which is what a file transfer or a relay actually does. It is
+// also where the negotiated frame size shows up, since a write spanning
+// several frames costs one syscall per frame.
+
+const largeWrite = 1 << 20
+
+func BenchmarkBulkLargeMux(b *testing.B) {
+	cs, ss := muxPair(b)
+	ctx := context.Background()
+
+	go func() {
+		for {
+			st, err := ss.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go io.Copy(io.Discard, st)
+		}
+	}()
+
+	st, err := cs.OpenStream(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]byte, largeWrite)
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := st.Write(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkBulkLargeYamux(b *testing.B) {
+	cs, ss := yamuxPair(b)
+
+	go func() {
+		for {
+			st, err := ss.AcceptStream()
+			if err != nil {
+				return
+			}
+			go io.Copy(io.Discard, st)
+		}
+	}()
+
+	st, err := cs.OpenStream()
+	if err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]byte, largeWrite)
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := st.Write(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // --- many-stream small messages (the batching-sensitive workload) ---
 
 const (

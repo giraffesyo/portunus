@@ -71,6 +71,21 @@ type Config struct {
 
 	// MaxFrameSize is the largest DATA payload we accept. Bounds between
 	// frame.FloorMaxFrameSize (16KB) and frame.MaxLength. Default 64KB.
+	//
+	// It sets two things at once: how many syscalls a byte of bulk costs,
+	// and how long a small message can wait behind a large one inside a
+	// session. Divide the frame size by the link rate for that worst case.
+	// At 100mbit a 64KB frame is about 5ms and a 128KB frame about 10ms; on
+	// a 36mbit path they are 14ms and 29ms.
+	//
+	// Raising it to 128KB measured about 23% more throughput on writes
+	// spanning several frames, and nothing at all on writes of one frame or
+	// less. It stays at 64KB because that gain is only available to bulk
+	// senders while the delay is paid by every latency-sensitive stream
+	// sharing the session, and because a loopback benchmark cannot show the
+	// second half of that trade. Raise it when the link is fast and the
+	// traffic is bulk; lower it toward the floor for interactive traffic on
+	// a slow link.
 	MaxFrameSize uint32
 
 	// MaxIncomingStreams caps concurrently live peer-initiated streams. A

@@ -5,6 +5,44 @@ yamux at its 16MB max window with keepalive off, mux at the same 16MB window.
 Comparing our default window against yamux's tuned one measures configuration,
 not implementation — see "A note on windows" below.
 
+## Single-stream bulk: 1.8x, and why the 2x target is not met
+
+Profiled rather than guessed at. On the bulk path the CPU profile is 61% raw
+syscalls and 22% netpoller, with essentially nothing in this library's own
+code: no parsing, no copying, no contention. Throughput is set by how many
+syscalls a byte costs, so that is the only lever.
+
+Frame size is that lever, because a write spanning several frames costs one
+syscall per frame. Measured with 1MB writes, mux alone:
+
+| MaxFrameSize | throughput |
+|---|---|
+| 64KB | 10.6 GB/s |
+| 128KB | 13.0 GB/s |
+| 256KB | 13.6 GB/s |
+
+128KB is the knee. But against a fair baseline the target still is not
+reached, because yamux gains from large writes too:
+
+| Workload | mux | yamux | ratio |
+|---|---|---|---|
+| 64KB writes (one frame) | 10.4 GB/s | 5.4 GB/s | 1.83x |
+| 1MB writes (many frames) | 12.6 GB/s | 7.7 GB/s | 1.58x |
+
+**The default stays at 64KB.** The gain is only available to bulk senders,
+while the cost is paid by every latency-sensitive stream sharing the session:
+frame size divided by link rate is how long a small message waits behind a
+large one, so 128KB is about 10ms on 100mbit and about 29ms on the 36mbit
+path this library was built for. A loopback benchmark shows the gain and
+structurally cannot show that cost, which is the same trap the WAN harness
+set earlier. The knob and both numbers are documented on Config.MaxFrameSize
+so an operator with a fast link can take the throughput.
+
+So the design's three targets stand at: many-stream small messages met many
+times over, zero allocations per frame met, and single-stream bulk at 1.8x
+against a goal of 2x, with the remaining distance understood and available by
+configuration rather than unexplained.
+
 ## Allocations: the steady-state target is met
 
 | Benchmark | allocs/op | bytes/op |
