@@ -326,22 +326,33 @@ flow-control budget was. Two conclusions:
    argument for BDP autotuning (M5) — the window should find its own size.
 
 
-## Note: why stream objects are not pooled yet
+## Note: stream objects are not pooled, and the measurement says not to
 
 DESIGN.md calls for reusing stream structs with a generation counter so that
 use-after-close is a detectable error rather than pool corruption. It would
-remove roughly half of what stream churn still allocates.
+remove roughly half of what stream churn allocates: construction is 54% of
+the eleven allocations per open-and-close cycle.
 
-It has not been done, and the reason is risk rather than effort. Recycling an
-object the application still holds a reference to is the classic
-use-after-free hazard, and the mitigation is a generation check on every
-exported method — a dozen places, each one a chance to get it wrong. The
-lifecycle defects this package has actually shipped were all of that flavour:
-a reset overtaking its own SYN, a cancel racing the write that announces a
-stream, credit reserved and never returned. Adding struct recycling is the
-change most likely to add another.
+It was deferred once on risk, with the stated condition that the protocol
+state fuzzer should first be trustworthy enough to act as a net. That
+condition is now met — the fuzzer covers relay paths, in-flight writes,
+graceful drain, and operations on already-closed streams, and passes 1.3M
+interleavings — so the question was reopened and answered with a profile
+instead.
 
-The steady-state target is met without it, and churn at 11 allocs/op is
-already well under yamux's 38. The right time to take this on is with the
-protocol-state fuzzer running long enough to trust it as a net, not while it
-is still new.
+**Allocation does not appear in the top forty CPU nodes of the churn
+benchmark.** Background GC marking accounts for 0.58% and `mallocgc`,
+`newobject`, and `makechan` do not register at all. Pooling stream structs
+would therefore recover well under one percent of the time an open-and-close
+cycle takes, because that cycle is dominated by the syscalls carrying its
+frames, exactly like the bulk path.
+
+That is not worth what it costs. Recycling an object the application still
+holds a reference to is the classic use-after-free hazard, its mitigation is
+a generation check on every exported method, and the failure it risks is
+silent cross-stream corruption — one stream reading another's bytes. Every
+lifecycle defect this package has actually shipped has been of that flavour.
+Under one percent does not buy that risk.
+
+Churn is already 2.8x faster than yamux with a third of the allocations. The
+work is not deferred any longer; it is declined, with a number attached.

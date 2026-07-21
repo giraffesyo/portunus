@@ -51,6 +51,8 @@ func FuzzProtocolModel(f *testing.F) {
 	f.Add([]byte{opOpen, opWrite, 4, opDeadline, opClearDeadline, opWrite, 4, opCloseWrite})
 	f.Add([]byte{opOpen, opWrite, 3, opReadDeadline, opCloseWrite, opDrain})
 	f.Add([]byte{opOpen, opWrite, 5, opCloseWrite, opShutdown, opOpen, opDrain})
+	f.Add([]byte{opOpen, opWrite, 3, opCloseWrite, opUseAfterClose, opDrain})
+	f.Add([]byte{opOpen, opWrite, 6, opCancelWrite, 2, opUseAfterClose, opUseAfterClose})
 
 	f.Fuzz(func(t *testing.T, script []byte) {
 		if len(script) == 0 || len(script) > 256 {
@@ -97,6 +99,7 @@ const (
 	opClearDeadline
 	opReadDeadline
 	opShutdown
+	opUseAfterClose
 	opCount
 )
 
@@ -112,6 +115,7 @@ type modelStream struct {
 	clean   bool   // every operation on it succeeded
 	closed  bool   // the script issued a terminal op: FIN or reset is on its way
 	noWrite bool   // no further writes, though the stream is not yet terminated
+	aborted bool   // CancelWrite was called, so the send side can never send a FIN
 
 	// mayRefuse marks a stream the peer is entitled to reject rather than
 	// accept. Opening is purely local and a stream announces itself only on
@@ -246,6 +250,7 @@ func runModelScript(t *testing.T, script []byte) {
 			ms.st.CancelWrite(code)
 			ms.clean = false
 			ms.closed = true
+			ms.aborted = true
 
 		case opCancelRead:
 			code := CodeApp + uint64(d.next())
@@ -258,6 +263,9 @@ func runModelScript(t *testing.T, script []byte) {
 			if ms == nil || ms.closed {
 				continue
 			}
+			// Close half-closes the send side cleanly and cancels the read
+			// side; it does not abandon sending, so a later CloseWrite is
+			// idempotent rather than an error.
 			ms.st.Close()
 			ms.clean = false
 			ms.closed = true
@@ -360,6 +368,35 @@ func runModelScript(t *testing.T, script []byte) {
 					shutdownDone <- client.Shutdown(sctx)
 				}()
 			}
+
+		case opUseAfterClose:
+			// Operating on a finished stream must fail cleanly, never
+			// succeed and never touch another stream's state. This is the
+			// property that recycling stream objects would put at risk, so
+			// it is asserted before any such change rather than after.
+			ms := pick(streams, cur)
+			if ms == nil || !ms.closed {
+				continue
+			}
+			if n, err := ms.st.Write([]byte("after close")); err == nil {
+				t.Fatalf("stream %d: write succeeded after close (%d bytes)", ms.id, n)
+			}
+			// Half-closing an abandoned send side must report the
+			// abandonment. Half-closing an already half-closed stream must
+			// not: that is idempotent and returns nil, which is why the
+			// check is on abandonment rather than on the stream merely
+			// having seen an error.
+			if ms.aborted {
+				if err := ms.st.CloseWrite(); err == nil {
+					t.Fatalf("stream %d: CloseWrite reported success after the send side was abandoned", ms.id)
+				}
+			}
+			// These are defined as idempotent, so they must not panic or
+			// wedge; nothing is asserted about their effect.
+			ms.st.CancelWrite(CodeApp)
+			ms.st.CancelRead(CodeApp)
+			ms.st.Close()
+			ms.st.SetDeadline(time.Now().Add(time.Second))
 
 		case opNextStream:
 			if len(streams) > 0 {
