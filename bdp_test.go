@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -254,45 +255,52 @@ func TestBDPIgnoresUnstampedProbe(t *testing.T) {
 
 // Keepalive must declare a silent peer dead, and must judge that on
 // receive-side silence rather than on our ability to send.
+//
+// Run in a synctest bubble: the clock is fake and advances only once every
+// goroutine is durably blocked, so the keepalive interval and liveness
+// timeout elapse the instant the session has nothing left to do. That makes
+// the outcome exact rather than a race against a wall-clock budget, and
+// removes the arbitrary timeout this test used to need to avoid hanging.
 func TestKeepaliveDetectsSilentPeer(t *testing.T) {
-	a, b := net.Pipe()
-	defer b.Close()
-	// Drain but never respond: the carrier is writable, the peer is not
-	// alive. Sending succeeds throughout, so only receive-side silence can
-	// detect this.
-	go io.Copy(io.Discard, b)
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		defer b.Close()
+		// Drain but never respond: the carrier is writable, the peer is not
+		// alive. Sending succeeds throughout, so only receive-side silence
+		// can detect this.
+		go io.Copy(io.Discard, b)
 
-	sess, err := Client(a, &Config{
-		KeepaliveInterval: 40 * time.Millisecond,
-		KeepaliveTimeout:  150 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
+		sess, err := Client(a, &Config{
+			KeepaliveInterval: 40 * time.Millisecond,
+			KeepaliveTimeout:  150 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
 
-	done := make(chan error, 1)
-	go func() { done <- sess.Wait() }()
-	select {
-	case err := <-done:
-		if err == nil {
+		// A bubble that deadlocks fails the test, so a keepalive that never
+		// fired would be reported here rather than hanging.
+		if err := sess.Wait(); err == nil {
 			t.Fatal("session ended with nil error")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("keepalive did not detect a silent peer")
-	}
+	})
 }
 
 // A responsive peer must never be declared dead.
 func TestKeepaliveToleratesLiveIdlePeer(t *testing.T) {
-	client, _ := pair(t, &Config{
-		KeepaliveInterval: 20 * time.Millisecond,
-		KeepaliveTimeout:  200 * time.Millisecond,
+	synctest.Test(t, func(t *testing.T) {
+		client, _ := pipePair(t, &Config{
+			KeepaliveInterval: 20 * time.Millisecond,
+			KeepaliveTimeout:  200 * time.Millisecond,
+		})
+		// Thirty probe intervals with no traffic, and no real time spent.
+		time.Sleep(600 * time.Millisecond)
+		synctest.Wait()
+		if err := client.closedErr(); err != nil {
+			t.Fatalf("keepalive killed a live idle session: %v", err)
+		}
 	})
-	time.Sleep(600 * time.Millisecond) // many probe intervals, no traffic
-	if err := client.closedErr(); err != nil {
-		t.Fatalf("keepalive killed a live idle session: %v", err)
-	}
 }
 
 func TestIncoherentKeepaliveConfigRejected(t *testing.T) {

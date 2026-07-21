@@ -183,18 +183,17 @@ func bytes256KB() []byte {
 	return b
 }
 
-// fuzzPair is an in-memory session pair with keepalive disabled, so fuzz
-// iterations are not perturbed by timers.
+// pipePair returns a session pair over net.Pipe.
 //
-// It deliberately avoids a real TCP pair: at fuzzing rates that exhausts
-// ephemeral ports within seconds, and the resulting dial failures look like
-// crashes. Because net.Pipe is a synchronous rendezvous and each constructor
+// Preferred over a real TCP pair wherever the carrier is not what is under
+// test. Fuzzing at full rate exhausts ephemeral ports within seconds, and the
+// resulting dial failures look like crashes; synctest forbids real networking
+// outright. Because net.Pipe is a synchronous rendezvous and each constructor
 // writes SETTINGS before returning, the two sessions must be built
 // concurrently or they deadlock on each other's handshake.
-func fuzzPair(t *testing.T) (*NativeSession, *NativeSession) {
+func pipePair(t *testing.T, cfg *Config) (*NativeSession, *NativeSession) {
 	t.Helper()
 	a, b := net.Pipe()
-	cfg := &Config{KeepaliveInterval: -1}
 
 	type res struct {
 		s   *NativeSession
@@ -215,4 +214,9 @@ func fuzzPair(t *testing.T) (*NativeSession, *NativeSession) {
 	}
 	t.Cleanup(func() { client.Close(); r.s.Close() })
 	return client, r.s
+}
+
+func fuzzPair(t *testing.T) (*NativeSession, *NativeSession) {
+	t.Helper()
+	return pipePair(t, &Config{KeepaliveInterval: -1})
 }

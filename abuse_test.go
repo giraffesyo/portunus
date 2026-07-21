@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/giraffesyo/portunus/internal/frame"
@@ -277,60 +278,67 @@ func TestIdleStreamsAreReapedWhenEnabled(t *testing.T) {
 		KeepaliveInterval: 30 * time.Millisecond,
 		KeepaliveTimeout:  5 * time.Second,
 	}
-	client, server := pair(t, cfg)
-	c := ctx(t)
+	synctest.Test(t, func(t *testing.T) {
+		client, server := pipePair(t, cfg)
+		c := ctx(t)
 
-	// Open streams, send once, then go quiet — a silent peer holding slots.
-	for range 4 {
-		st, err := client.OpenStream(c)
-		if err != nil {
-			t.Fatal(err)
+		// Open streams, send once, then go quiet — a silent peer holding
+		// slots.
+		for range 4 {
+			st, err := client.OpenStream(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.Write([]byte("x")); err != nil {
+				t.Fatal(err)
+			}
 		}
-		if _, err := st.Write([]byte("x")); err != nil {
-			t.Fatal(err)
+		for range 4 {
+			if _, err := server.AcceptStream(c); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	for range 4 {
-		if _, err := server.AcceptStream(c); err != nil {
-			t.Fatal(err)
-		}
-	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+		// Fake time, so this crosses several idle timeouts and sweep ticks
+		// instantly. Wait then settles every goroutine, which means the
+		// check below sees the finished state rather than polling for it.
+		time.Sleep(4 * cfg.StreamIdleTimeout)
+		synctest.Wait()
+
 		server.mu.Lock()
 		live := server.incoming
 		server.mu.Unlock()
-		if live == 0 {
-			if got := server.Stats().StreamsReaped; got == 0 {
-				t.Error("reaped streams were not counted")
-			}
-			return
+		if live != 0 {
+			t.Fatalf("%d idle streams were never reaped", live)
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("idle streams were never reaped")
+		if got := server.Stats().StreamsReaped; got == 0 {
+			t.Error("reaped streams were not counted")
+		}
+	})
 }
 
 // With reaping off (the default), a quiet stream must survive: holding a
 // connection open with no traffic is normal for a tunnel.
 func TestIdleStreamsSurviveByDefault(t *testing.T) {
-	client, server := pair(t, &Config{
-		KeepaliveInterval: 20 * time.Millisecond,
-		KeepaliveTimeout:  5 * time.Second,
+	synctest.Test(t, func(t *testing.T) {
+		client, server := pipePair(t, &Config{
+			KeepaliveInterval: 20 * time.Millisecond,
+			KeepaliveTimeout:  5 * time.Second,
+		})
+		cs, ss := openAccept(t, client, server)
+
+		time.Sleep(300 * time.Millisecond) // many keepalive sweeps
+		synctest.Wait()
+
+		if _, err := cs.Write([]byte("still here")); err != nil {
+			t.Fatalf("quiet stream was reaped with reaping disabled: %v", err)
+		}
+		buf := make([]byte, len("still here"))
+		ss.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.ReadFull(ss, buf); err != nil {
+			t.Fatalf("peer end unusable: %v", err)
+		}
 	})
-	cs, ss := openAccept(t, client, server)
-
-	time.Sleep(300 * time.Millisecond) // many keepalive sweeps
-
-	if _, err := cs.Write([]byte("still here")); err != nil {
-		t.Fatalf("quiet stream was reaped with reaping disabled: %v", err)
-	}
-	buf := make([]byte, len("still here"))
-	ss.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := io.ReadFull(ss, buf); err != nil {
-		t.Fatalf("peer end unusable: %v", err)
-	}
 }
 
 // With reset limiting off (the default), rapid stream churn must be allowed:

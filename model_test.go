@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -571,28 +570,7 @@ func pick(streams []*modelStream, cur int) *modelStream {
 // are neither perturbed by timers nor limited by ephemeral ports.
 func modelPair(t *testing.T) (*NativeSession, *NativeSession) {
 	t.Helper()
-	a, b := net.Pipe()
-	cfg := &Config{KeepaliveInterval: -1}
-
-	type res struct {
-		s   *NativeSession
-		err error
-	}
-	ch := make(chan res, 1)
-	go func() {
-		s, err := Server(b, cfg)
-		ch <- res{s, err}
-	}()
-	client, err := Client(a, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := <-ch
-	if r.err != nil {
-		t.Fatal(r.err)
-	}
-	t.Cleanup(func() { client.Close(); r.s.Close() })
-	return client, r.s
+	return pipePair(t, &Config{KeepaliveInterval: -1})
 }
 
 // decoder turns fuzz input into an operation script.
