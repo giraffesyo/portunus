@@ -61,6 +61,7 @@ type preamble struct {
 func main() {
 	var (
 		mode      = flag.String("mode", "client", "server or client")
+		verbose   = flag.Bool("verbose", false, "server: log session stats after each run")
 		listen    = flag.String("listen", ":7777", "server listen address")
 		addr      = flag.String("addr", "", "server address to dial")
 		impl      = flag.String("impl", "portunus", "portunus, yamux, or raw")
@@ -83,7 +84,7 @@ func main() {
 
 	switch *mode {
 	case "server":
-		if err := runServer(*listen); err != nil {
+		if err := runServer(*listen, *verbose); err != nil {
 			log.Fatal(err)
 		}
 	case "client":
@@ -150,7 +151,7 @@ func aggregate(in io.Reader, out io.Writer) error {
 		groups[k] = append(groups[k], r)
 	}
 
-	fmt.Fprintf(out, "| scenario | impl | runs | MB/s | Gbit/s | ops/s | p50 us | p99 us | load MB/s |\n")
+	fmt.Fprintf(out, "| scenario | impl | runs | MB/s | range | ops/s | p50 us | p99 us | load MB/s |\n")
 	fmt.Fprintf(out, "|---|---|---|---|---|---|---|---|---|\n")
 	for _, k := range order {
 		g := groups[k]
@@ -161,7 +162,7 @@ func aggregate(in io.Reader, out io.Writer) error {
 		fmt.Fprintf(out, "| %s | %s | %d | %s | %s | %s | %s | %s | %s |\n",
 			k.label, name, len(g),
 			med(g, func(r Result) float64 { return r.MBPerSec }),
-			med(g, func(r Result) float64 { return r.GbitPerSec }),
+			spread(g, func(r Result) float64 { return r.MBPerSec }),
 			med(g, func(r Result) float64 { return r.OpsPerSec }),
 			med(g, func(r Result) float64 { return r.P50us }),
 			med(g, func(r Result) float64 { return r.P99us }),
@@ -171,21 +172,40 @@ func aggregate(in io.Reader, out io.Writer) error {
 	return nil
 }
 
+// spread prints the range behind each median. On a shared link or a shared
+// host the median alone invites conclusions the data cannot support: two
+// configurations whose ranges overlap have not been shown to differ, however
+// far apart their midpoints are.
+func spread(g []Result, f func(Result) float64) string {
+	vals := collect(g, f)
+	if len(vals) == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f-%.1f", vals[0], vals[len(vals)-1])
+}
+
 // med returns the median of one field, or a dash when the scenario did not
 // measure it. An omitted metric is left blank rather than printed as zero,
 // which would read as "measured, and it was nothing".
 func med(g []Result, f func(Result) float64) string {
+	vals := collect(g, f)
+	if len(vals) == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f", vals[len(vals)/2])
+}
+
+// collect returns one field across a group, sorted, skipping the runs that
+// did not measure it.
+func collect(g []Result, f func(Result) float64) []float64 {
 	vals := make([]float64, 0, len(g))
 	for _, r := range g {
 		if v := f(r); v != 0 {
 			vals = append(vals, v)
 		}
 	}
-	if len(vals) == 0 {
-		return "-"
-	}
 	sort.Float64s(vals)
-	return fmt.Sprintf("%.1f", vals[len(vals)/2])
+	return vals
 }
 
 // ---------------------------------------------------------------- transport
@@ -340,7 +360,7 @@ func yamuxConfig(window int) *yamux.Config {
 
 // ------------------------------------------------------------------- server
 
-func runServer(addr string) error {
+func runServer(addr string, verbose bool) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -352,14 +372,14 @@ func runServer(addr string) error {
 			return err
 		}
 		go func() {
-			if err := handle(c); err != nil && err != io.EOF {
+			if err := handle(c, verbose); err != nil && err != io.EOF {
 				log.Printf("connection from %s: %v", c.RemoteAddr(), err)
 			}
 		}()
 	}
 }
 
-func handle(c net.Conn) error {
+func handle(c net.Conn, verbose bool) error {
 	defer c.Close()
 
 	buf := make([]byte, preambleSize)
@@ -383,6 +403,22 @@ func handle(c net.Conn) error {
 		return err
 	}
 	defer sess.Close()
+
+	// The receiving side is where autotuning happens, so its own counters
+	// are the only direct evidence of whether the window grew. Inferring it
+	// from throughput alone cannot separate "the window stayed small" from
+	// "the link was slow".
+	if verbose {
+		defer func() {
+			if ps, ok := sess.(portunusSession); ok {
+				st := ps.s.Stats()
+				log.Printf("%s/%s streams=%d: stalls=%d rtt=%v target=%d granted=%d recv=%d frames/flush=%.1f",
+					p.Impl, p.Scenario, p.Streams,
+					st.WindowStalls, st.RTT, st.WindowTarget,
+					st.GrantedBytes, st.BytesReceived, st.FramesPerFlush)
+			}
+		}()
+	}
 
 	ctx := context.Background()
 	switch p.Scenario {
