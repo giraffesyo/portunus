@@ -97,7 +97,12 @@ jobs:
         # survival, credit accounting, and liveness across randomized
         # interleavings, which is the class of defect input fuzzing cannot
         # reach and where this package's worst bugs have actually been.
-        run: go test -run XXX -fuzz=FuzzProtocolModel -fuzztime=180s .
+        #
+        # Concurrency is capped because every execution builds two real
+        # sessions with their goroutines and buffers. At one worker per core
+        # the fuzzing process dies of its own weight and reports "hung or
+        # terminated" instead of whatever it found.
+        run: go test -run XXX -fuzz=FuzzProtocolModel -fuzztime=180s -parallel=4 .
 
       - name: Report any crashers
         if: failure()

@@ -1,6 +1,7 @@
 package portunus
 
 import (
+	"context"
 	"net"
 	"os"
 	"sync"
@@ -561,6 +562,47 @@ func (w *writer) writeOut() error {
 		buf = buf[n:]
 	}
 	return nil
+}
+
+// drain blocks until everything staged has reached the carrier.
+//
+// A graceful shutdown must not close the connection with frames still in the
+// batch. Streams are reaped as soon as both their directions finish, which
+// can happen while the frames announcing and ending them are still queued, so
+// a drain that waited only for streams would close the carrier and discard
+// them — the peer never learns the streams existed. Found by the protocol
+// model fuzzer, which noticed the peer being told about fewer streams than
+// were sent.
+func (w *writer) drain(ctx context.Context) error {
+	t := time.NewTicker(time.Millisecond)
+	defer t.Stop()
+	for {
+		w.mu.Lock()
+		if w.err != nil {
+			err := w.err
+			w.mu.Unlock()
+			return err
+		}
+		if w.pending == 0 && !w.flushing {
+			w.mu.Unlock()
+			return nil
+		}
+		// Nothing staged is guaranteed a flusher, so take the duty rather
+		// than waiting for one that may never arrive.
+		flush := w.claimFlushLocked()
+		w.mu.Unlock()
+		if flush {
+			w.flushLoop()
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-w.s.done:
+			return w.s.closedErr()
+		case <-t.C:
+		}
+	}
 }
 
 // fail releases every parked writer when the session dies for a reason the

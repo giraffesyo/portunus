@@ -476,3 +476,67 @@ func TestResetNeverOvertakesItsOwnSYN(t *testing.T) {
 		server.Close()
 	}
 }
+
+// A graceful shutdown must deliver what it has already accepted.
+//
+// Streams are reaped as soon as both directions finish, which can happen
+// while the frames announcing and ending them are still sitting in the send
+// batch. A Shutdown that waited only for streams would then close the carrier
+// and discard those frames, and the peer would never learn the streams
+// existed — the opposite of what draining is for.
+func TestShutdownFlushesQueuedFrames(t *testing.T) {
+	for range 50 {
+		client, server := pair(t, nil)
+		c := ctx(t)
+
+		accepted := make(chan uint64, 16)
+		go func() {
+			for {
+				st, err := server.AcceptStream(c)
+				if err != nil {
+					return
+				}
+				accepted <- st.StreamID()
+				go func(st Stream) { io.Copy(io.Discard, st); st.Close() }(st)
+			}
+		}()
+
+		// Open and immediately half-close, so each stream's only frame is a
+		// SYN carrying FIN, and every stream is reaped the moment it is
+		// written. Then drain straight away.
+		const streams = 4
+		var want []uint64
+		for range streams {
+			st, err := client.OpenStream(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			want = append(want, st.StreamID())
+			st.Close()
+		}
+		if err := client.Shutdown(c); err != nil {
+			t.Fatalf("shutdown: %v", err)
+		}
+
+		got := map[uint64]bool{}
+		deadline := time.After(5 * time.Second)
+		for range streams {
+			select {
+			case id := <-accepted:
+				got[id] = true
+			case <-deadline:
+				t.Fatalf("shutdown delivered %d of %d streams; the rest were discarded with the batch",
+					len(got), streams)
+			}
+		}
+		for _, id := range want {
+			if !got[id] {
+				t.Fatalf("stream %d never reached the peer", id)
+			}
+		}
+		server.Close()
+	}
+}

@@ -937,6 +937,13 @@ func (s *NativeSession) Shutdown(ctx context.Context) error {
 		n := len(s.streams)
 		s.mu.Unlock()
 		if n == 0 {
+			// Everything staged must reach the carrier before it closes,
+			// or a graceful shutdown discards the frames that finish the
+			// very streams it waited for.
+			if err := s.w.drain(ctx); err != nil && ctx.Err() != nil {
+				_ = s.Close()
+				return ctx.Err()
+			}
 			return s.Close()
 		}
 		select {

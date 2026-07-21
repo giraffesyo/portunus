@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,6 +46,11 @@ func FuzzProtocolModel(f *testing.F) {
 	f.Add([]byte{opOpen, opOpen, opWrite, 5, opNextStream, opWrite, 6, opCloseWrite, opDrain})
 	f.Add([]byte{opOpen, opWrite, 4, opCancelRead, opCloseWrite, opDrain})
 	f.Add([]byte{opOpen, opDeadline, opWrite, 9, opCloseWrite, opDrain})
+	f.Add([]byte{opOpen, opCopyWrite, 7, opCloseWrite, opDrain})
+	f.Add([]byte{opOpen, opRacingWrite, 8, opCancelWrite, 1, opDrain})
+	f.Add([]byte{opOpen, opWrite, 4, opDeadline, opClearDeadline, opWrite, 4, opCloseWrite})
+	f.Add([]byte{opOpen, opWrite, 3, opReadDeadline, opCloseWrite, opDrain})
+	f.Add([]byte{opOpen, opWrite, 5, opCloseWrite, opShutdown, opOpen, opDrain})
 
 	f.Fuzz(func(t *testing.T, script []byte) {
 		if len(script) == 0 || len(script) > 256 {
@@ -53,6 +59,26 @@ func FuzzProtocolModel(f *testing.F) {
 		runModelScript(t, script)
 	})
 }
+
+// modelWait bounds the checks that can only fail by hanging.
+//
+// It must stay well under the point where the fuzzing coordinator gives up on
+// a worker that has not reported progress. Raising it past that does not make
+// the check more patient, it makes the failure unreadable: the worker is
+// killed first and the run reports only "fuzzing process hung or terminated
+// unexpectedly", with the assertion that would have named the problem never
+// reaching the log. Every real finding here surfaced after lowering it.
+const modelWait = 5 * time.Second
+
+// modelScriptBytes caps how much one script may write across all its streams.
+//
+// A fuzzing session runs one worker per core, each executing thousands of
+// scripts a second, and every script builds a session pair whose buffers and
+// goroutines live until the iteration ends. Without a budget a script can ask
+// for megabytes, and the fuzzing process dies of its own weight rather than
+// finding anything. The individual sizes still straddle every branch in the
+// send path; only the total is bounded.
+const modelScriptBytes = 256 << 10
 
 // Opcodes. Values are the raw bytes a fuzz input is decoded from, so the
 // mutator can reach every operation by flipping a single byte.
@@ -66,6 +92,11 @@ const (
 	opDeadline
 	opNextStream
 	opDrain
+	opCopyWrite   // io.Copy into the stream, exercising ReadFrom
+	opRacingWrite // a write left in flight while the next op runs
+	opClearDeadline
+	opReadDeadline
+	opShutdown
 	opCount
 )
 
@@ -79,7 +110,16 @@ type modelStream struct {
 	id      uint64
 	written []byte // bytes Write reported as accepted
 	clean   bool   // every operation on it succeeded
-	closed  bool   // send side finished, so the peer will see EOF or a reset
+	closed  bool   // the script issued a terminal op: FIN or reset is on its way
+	noWrite bool   // no further writes, though the stream is not yet terminated
+
+	// mayRefuse marks a stream the peer is entitled to reject rather than
+	// accept. Opening is purely local and a stream announces itself only on
+	// its first frame, so one opened before a drain but first written after
+	// the peer's GOAWAY arrives is a new stream as far as the peer is
+	// concerned, and refusing it is what draining means. The model must
+	// allow that outcome rather than wait for a delivery that will not come.
+	mayRefuse bool
 
 	// announced records that at least one frame for this stream reached the
 	// send path, which is what makes the peer aware of it at all. A stream
@@ -117,7 +157,12 @@ func runModelScript(t *testing.T, script []byte) {
 				return
 			}
 			go func(st Stream) {
-				data, err := io.ReadAll(st)
+				// io.Copy prefers the source's WriteTo, so draining this
+				// way exercises the relay path that a proxy uses, which
+				// io.ReadAll would bypass entirely.
+				var buf bytes.Buffer
+				_, err := io.Copy(&buf, st)
+				data := buf.Bytes()
 				select {
 				case results <- struct {
 					id uint64
@@ -131,9 +176,13 @@ func runModelScript(t *testing.T, script []byte) {
 	}()
 
 	var (
-		streams []*modelStream
-		cur     int
-		d       = decoder{b: script}
+		streams      []*modelStream
+		cur          int
+		budget       = modelScriptBytes
+		d            = decoder{b: script}
+		racing       sync.WaitGroup
+		draining     bool
+		shutdownDone chan error
 	)
 
 	for d.more() {
@@ -144,23 +193,27 @@ func runModelScript(t *testing.T, script []byte) {
 			}
 			st, err := client.OpenStream(ctx)
 			if err != nil {
-				// Only a dying or draining session may refuse, and
-				// nothing in this script drains one.
+				if draining {
+					continue // refusing new streams is the point of a drain
+				}
 				t.Fatalf("OpenStream failed on a live session: %v", err)
 			}
-			streams = append(streams, &modelStream{st: st, id: st.StreamID(), clean: true})
+			streams = append(streams, &modelStream{
+				st: st, id: st.StreamID(), clean: true, mayRefuse: draining,
+			})
 			cur = len(streams) - 1
 
 		case opWrite:
 			size := writeSizes[int(d.next())%len(writeSizes)]
 			ms := pick(streams, cur)
-			if ms == nil || ms.closed {
+			if ms == nil || ms.closed || ms.noWrite {
 				continue
 			}
-			payload := make([]byte, size)
-			for i := range payload {
-				payload[i] = byte(len(ms.written) + i)
+			if size > budget {
+				size = budget
 			}
+			budget -= size
+			payload := patternFor(ms, size)
 			n, err := ms.st.Write(payload)
 			// Record what was accepted, not what was offered: a write
 			// can legally report a short count with an error.
@@ -217,6 +270,97 @@ func runModelScript(t *testing.T, script []byte) {
 				ms.clean = false
 			}
 
+		case opCopyWrite:
+			size := writeSizes[int(d.next())%len(writeSizes)]
+			ms := pick(streams, cur)
+			if ms == nil || ms.closed || ms.noWrite {
+				continue
+			}
+			if size > budget {
+				size = budget
+			}
+			budget -= size
+			payload := patternFor(ms, size)
+			// io.Copy prefers the destination's ReadFrom, so this reaches
+			// the send-side relay path that plain Write does not.
+			n, err := io.Copy(ms.st, bytes.NewReader(payload))
+			ms.written = append(ms.written, payload[:n]...)
+			if n > 0 {
+				ms.announced = true
+			}
+			if err != nil {
+				ms.clean = false
+			}
+
+		case opRacingWrite:
+			size := writeSizes[int(d.next())%len(writeSizes)]
+			ms := pick(streams, cur)
+			if ms == nil || ms.closed || ms.noWrite {
+				continue
+			}
+			if size > budget {
+				size = budget
+			}
+			budget -= size
+			payload := patternFor(ms, size)
+			// Left in flight deliberately: a write racing whatever comes
+			// next is how the worst defect in this package was produced,
+			// a cancel and a first write resolving in the wrong order.
+			//
+			// What it achieved is recorded by the write itself rather than
+			// assumed. Assuming it announced the stream is wrong in the
+			// case this op exists to reach: when the cancel wins, nothing
+			// is sent and the peer never learns the stream existed, so
+			// waiting for a result from it would hang. No further writes
+			// follow, so appending its bytes on completion keeps them in
+			// order, and everything the model reads is read after the wait.
+			racing.Add(1)
+			go func() {
+				defer racing.Done()
+				n, _ := ms.st.Write(payload)
+				ms.written = append(ms.written, payload[:n]...)
+				if n > 0 {
+					ms.announced = true
+				}
+			}()
+			ms.clean = false
+			// Not "closed": nothing terminal has been sent. Conflating the
+			// two would let the script finish without ever issuing a FIN or
+			// a reset, leaving the peer reading a stream that never ends.
+			ms.noWrite = true
+
+		case opClearDeadline:
+			if ms := pick(streams, cur); ms != nil {
+				ms.st.SetDeadline(time.Time{})
+			}
+
+		case opReadDeadline:
+			if ms := pick(streams, cur); ms != nil {
+				ms.st.SetReadDeadline(time.Now().Add(-time.Millisecond))
+				ms.clean = false
+			}
+
+		case opShutdown:
+			// Draining runs in the background: it waits for live streams,
+			// which this script closes at the end. Opens may legitimately
+			// fail from here on.
+			if !draining {
+				draining = true
+				// Anything not yet on the wire may arrive at the peer after
+				// its GOAWAY and be refused.
+				for _, ms := range streams {
+					if !ms.announced {
+						ms.mayRefuse = true
+					}
+				}
+				shutdownDone = make(chan error, 1)
+				go func() {
+					sctx, scancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer scancel()
+					shutdownDone <- client.Shutdown(sctx)
+				}()
+			}
+
 		case opNextStream:
 			if len(streams) > 0 {
 				cur = (cur + 1) % len(streams)
@@ -228,7 +372,11 @@ func runModelScript(t *testing.T, script []byte) {
 		}
 	}
 
-	// Finish every stream so the peer's ReadAll can terminate.
+	// Writes left in flight must land before the model is compared, or a
+	// prefix check would race the very thing it is checking.
+	racing.Wait()
+
+	// Finish every stream so the peer's drain can terminate.
 	expected := 0
 	for _, ms := range streams {
 		if !ms.closed {
@@ -239,7 +387,7 @@ func runModelScript(t *testing.T, script []byte) {
 			}
 			ms.closed = true
 		}
-		if ms.announced {
+		if ms.announced && !ms.mayRefuse {
 			expected++
 		}
 	}
@@ -256,20 +404,23 @@ func runModelScript(t *testing.T, script []byte) {
 			if !ok {
 				t.Fatalf("peer reported stream %d that was never opened", got.id)
 			}
-			checkDelivery(t, ms, got.observed)
-		case <-time.After(15 * time.Second):
+			checkDelivery(t, ms, got.observed, draining)
+		case <-time.After(modelWait):
 			// Property 4: liveness.
 			t.Fatal("a stream never finished draining at the peer")
 		}
 	}
 
 	// Property 2: survival. Nothing above is a protocol violation or an
-	// abuse of the peer, so both sessions must still be healthy.
-	if err := client.closedErr(); err != nil {
-		t.Fatalf("client session died during legal operations: %v", err)
-	}
-	if err := server.closedErr(); err != nil {
-		t.Fatalf("server session died during legal operations: %v", err)
+	// abuse of the peer, so a session must only end where the script asked
+	// for it.
+	if !draining {
+		if err := client.closedErr(); err != nil {
+			t.Fatalf("client session died during legal operations: %v", err)
+		}
+		if err := server.closedErr(); err != nil {
+			t.Fatalf("server session died during legal operations: %v", err)
+		}
 	}
 
 	// Property 3: accounting. Every stream is finished, so once both sides
@@ -277,14 +428,30 @@ func runModelScript(t *testing.T, script []byte) {
 	for _, ms := range streams {
 		ms.st.Close()
 	}
-	checkBudgetDrains(t, client, "client")
-	checkBudgetDrains(t, server, "server")
+
+	// Property 5: a drain finishes. Checked after the closes above, because
+	// Shutdown waits for exactly those streams; waiting on it first is a
+	// deadlock that only resolves on a timeout.
+	if draining {
+		select {
+		case <-shutdownDone:
+		case <-time.After(modelWait):
+			t.Fatal("Shutdown never returned after every stream closed")
+		}
+	}
+
+	if !draining {
+		// A drained session closes its carrier, which reaps streams by a
+		// different route; the accounting claim is about ordinary use.
+		checkBudgetDrains(t, client, "client")
+		checkBudgetDrains(t, server, "server")
+	}
 }
 
 // checkDelivery compares what arrived against what the model says was sent.
-func checkDelivery(t *testing.T, ms *modelStream, got observed) {
+func checkDelivery(t *testing.T, ms *modelStream, got observed, draining bool) {
 	t.Helper()
-	if ms.clean {
+	if ms.clean && !draining {
 		if got.err != nil {
 			t.Fatalf("stream %d: cleanly closed but peer read failed: %v", ms.id, got.err)
 		}
@@ -304,10 +471,23 @@ func checkDelivery(t *testing.T, ms *modelStream, got observed) {
 	if !bytes.Equal(got.data, ms.written[:len(got.data)]) {
 		t.Fatalf("stream %d: received bytes are not a prefix of those written", ms.id)
 	}
-	var se *StreamError
-	if got.err != nil && !errors.As(got.err, &se) && !errors.Is(got.err, io.EOF) {
-		t.Fatalf("stream %d: peer read ended with %v, want a *StreamError or EOF", ms.id, got.err)
+	if got.err == nil || errors.Is(got.err, io.EOF) {
+		return
 	}
+	var se *StreamError
+	if errors.As(got.err, &se) {
+		return
+	}
+	// A session-level ending is legitimate only where the script asked for
+	// one: draining closes the carrier, and every stream still being read
+	// then ends with a session error rather than a stream error. Outside a
+	// drain it would mean the session died on its own, which the survival
+	// property forbids.
+	var sess *SessionError
+	if draining && errors.As(got.err, &sess) {
+		return
+	}
+	t.Fatalf("stream %d: peer read ended with %v, want a *StreamError or EOF", ms.id, got.err)
 }
 
 // checkBudgetDrains waits for streams to be reaped and asserts no receive
@@ -330,6 +510,17 @@ func checkBudgetDrains(t *testing.T, s *NativeSession, side string) {
 	s.mu.Unlock()
 	t.Fatalf("%s: %d streams still live and %d bytes of receive credit outstanding after every stream finished",
 		side, live, s.budget.outstanding())
+}
+
+// patternFor builds a payload whose bytes depend on the stream's position in
+// its own byte sequence, so a delivery check catches reordering and
+// duplication, not merely a wrong length.
+func patternFor(ms *modelStream, size int) []byte {
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(len(ms.written) + i)
+	}
+	return payload
 }
 
 func pick(streams []*modelStream, cur int) *modelStream {
