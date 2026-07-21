@@ -126,3 +126,51 @@ func TestSettingsRoundTrip(t *testing.T) {
 		t.Fatalf("empty settings: %v %v", out, err)
 	}
 }
+
+// Frame types are named in protocol errors and diagnostics, so the mapping is
+// worth pinning: a wrong or missing name turns a clear error into a puzzle.
+func TestTypeString(t *testing.T) {
+	for _, tc := range []struct {
+		typ  Type
+		want string
+	}{
+		{TypeData, "DATA"},
+		{TypeWindowUpdate, "WINDOW_UPDATE"},
+		{TypeRST, "RST"},
+		{TypeStopSending, "STOP_SENDING"},
+		{TypePing, "PING"},
+		{TypeGoAway, "GOAWAY"},
+		{TypeSettings, "SETTINGS"},
+		{TypePadding, "PADDING"},
+	} {
+		if got := tc.typ.String(); got != tc.want {
+			t.Errorf("Type(%d).String() = %q, want %q", tc.typ, got, tc.want)
+		}
+	}
+	// Values 8-15 fit the 4-bit type field but carry no meaning in v1; they
+	// must still render legibly rather than as an empty string.
+	if got := Type(9).String(); got != "UNKNOWN(9)" {
+		t.Errorf("Type(9).String() = %q, want %q", got, "UNKNOWN(9)")
+	}
+}
+
+// Short control payloads must be rejected rather than read past their end.
+// These are the sizes a hostile or buggy peer produces most easily.
+func TestShortControlPayloadsRejected(t *testing.T) {
+	for _, n := range []int{0, 1, 7} {
+		if _, err := ParseStopSending(make([]byte, n)); err == nil {
+			t.Errorf("ParseStopSending accepted %d bytes", n)
+		}
+		if _, err := ParsePing(make([]byte, n)); err == nil {
+			t.Errorf("ParsePing accepted %d bytes", n)
+		}
+	}
+	// Over-long is equally wrong: these payloads are fixed width, so extra
+	// bytes mean the sender and receiver disagree about the frame.
+	if _, err := ParseStopSending(make([]byte, StopSendingLen+1)); err == nil {
+		t.Error("ParseStopSending accepted an over-long payload")
+	}
+	if _, err := ParsePing(make([]byte, PingLen+1)); err == nil {
+		t.Error("ParsePing accepted an over-long payload")
+	}
+}
