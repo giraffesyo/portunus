@@ -415,3 +415,87 @@ func readFrames(t *testing.T, conn net.Conn) <-chan readFrame {
 	}()
 	return ch
 }
+
+// Data for a stream that has already been torn down must draw a STOP_SENDING,
+// not silence (SPEC.md §8 rule 6).
+//
+// Silence is what the rule used to be, and it stranded peers: a sender that
+// has exhausted its window is waiting for credit, and credit for a stream
+// that no longer exists never comes. Telling it to stop is the only signal
+// that reaches a writer parked on flow control.
+func TestProtocolStragglerDataDrawsStopSending(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+
+	frames := readFrames(t, b)
+	sess, err := Server(a, &Config{KeepaliveInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	send := func(h frame.Header, payload []byte) {
+		t.Helper()
+		var hdr [frame.HeaderSize]byte
+		h.Length = uint32(len(payload))
+		h.Encode(hdr[:])
+		b.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := b.Write(hdr[:]); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload) > 0 {
+			if _, err := b.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	settings, _ := frame.AppendSettings(nil, []frame.Setting{
+		{ID: frame.SettingVersion, Value: frame.ProtocolVersion},
+		{ID: frame.SettingInitialWindow, Value: frame.FloorInitialWindow},
+		{ID: frame.SettingMaxFrameSize, Value: frame.FloorMaxFrameSize},
+	})
+	send(frame.Header{Type: frame.TypeSettings}, settings)
+
+	// Open stream 3 and let the application finish with it, so it is reaped.
+	const id = 3
+	send(frame.Header{Type: frame.TypeData, Flags: frame.FlagSYN | frame.FlagFIN, StreamID: id}, []byte("x"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := sess.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(st)
+	st.Close()
+
+	// Wait for the stream to leave the session's table.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sess.mu.Lock()
+		n := len(sess.streams)
+		sess.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// A late DATA frame for that stream must be answered.
+	send(frame.Header{Type: frame.TypeData, StreamID: id}, []byte("late"))
+
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatal("peer closed without answering the straggler")
+			}
+			if f.h.Type == frame.TypeStopSending && f.h.StreamID == id {
+				return // the rule holds
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no STOP_SENDING for data on a torn-down stream; a peer blocked on credit would never learn to stop")
+		}
+	}
+}

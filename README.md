@@ -4,6 +4,9 @@ A stream multiplexer for Go: many logical streams over one reliable
 byte-stream carrier (TCP, TLS, a Unix socket, an SSH channel — anything
 satisfying `net.Conn`).
 
+The wire protocol is specified in [SPEC.md](SPEC.md); both ends of a
+connection must implement it.
+
 **Status: feature-complete, not yet released.** Everything through the
 hardening pass is built and tested; the version has not been tagged and the
 API may still move. See [DESIGN.md](DESIGN.md) for the architecture and

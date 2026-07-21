@@ -398,6 +398,11 @@ portable fallback — an experiment, not a v1 promise.
 
 ## Wire protocol (clean slate)
 
+The normative description lives in [SPEC.md](SPEC.md), which is what an
+independent implementation should be written against. What follows is the
+reasoning behind it; where the two disagree, SPEC.md describes the behaviour
+and this section describes the intent.
+
 Big-endian. Fixed 8-byte header:
 
 ```
