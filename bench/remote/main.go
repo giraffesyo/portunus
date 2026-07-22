@@ -32,6 +32,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"sort"
@@ -48,7 +50,7 @@ import (
 //
 // Oversized preambles are rejected rather than truncated, so a field added
 // later fails at the first run instead of silently arriving as zero.
-const preambleSize = 128
+const preambleSize = 256
 
 type preamble struct {
 	Impl        string `json:"impl"`
@@ -56,12 +58,38 @@ type preamble struct {
 	Streams     int    `json:"streams"`
 	Size        int    `json:"size"`
 	YamuxWindow int    `json:"yamux_window"`
+	// Library tuning under test, applied on both ends so the receiver's
+	// window and read buffer match the sender's expectation. Zero means the
+	// shipped default, so an ordinary run states nothing and gets the
+	// defaults it would in production.
+	InitWindow int `json:"iw,omitempty"`
+	MaxWindow  int `json:"mw,omitempty"`
+	RecvBuf    int `json:"rb,omitempty"`
+	MaxFrame   int `json:"mf,omitempty"`
+	// Priority marks the latency-sensitive stream of an rr or rrload run as
+	// priority on both ends, so a request frame is written ahead of bulk
+	// rather than behind it. Sent in the preamble so the server prioritizes
+	// its echo of the same stream; prioritizing only the client's send would
+	// fix one leg of the round trip and leave the reply queued behind bulk.
+	Priority bool `json:"prio,omitempty"`
+}
+
+// prioritizer is the optional priority control a portunus stream exposes and
+// yamux and raw do not. Type-asserting for it keeps the scenario code one body
+// across implementations: a stream that cannot prioritize is left unchanged.
+type prioritizer interface{ SetPriority(bool) }
+
+func setPriority(st stream, on bool) {
+	if p, ok := st.(prioritizer); ok {
+		p.SetPriority(on)
+	}
 }
 
 func main() {
 	var (
 		mode      = flag.String("mode", "client", "server or client")
 		verbose   = flag.Bool("verbose", false, "server: log session stats after each run")
+		pprofAddr = flag.String("pprof", "", "server: serve net/http/pprof on this address")
 		listen    = flag.String("listen", ":7777", "server listen address")
 		addr      = flag.String("addr", "", "server address to dial")
 		impl      = flag.String("impl", "portunus", "portunus, yamux, or raw")
@@ -73,6 +101,11 @@ func main() {
 		ywin      = flag.Int("yamux-window", 256<<10, "yamux receive window")
 		procs     = flag.Int("procs", 0, "GOMAXPROCS; 0 leaves it alone")
 		label     = flag.String("label", "", "free-form label copied into the result")
+		iw        = flag.Int("init-window", 0, "portunus InitialWindow; 0 = default")
+		mw        = flag.Int("max-window", 0, "portunus MaxWindow; 0 = default")
+		rb        = flag.Int("recv-buf", 0, "portunus ReadBufferSize; 0 = default")
+		mf        = flag.Int("max-frame", 0, "portunus MaxFrameSize; 0 = default")
+		prio      = flag.Bool("priority", false, "portunus: mark the rr/rrload request stream priority")
 	)
 	flag.Parse()
 
@@ -84,6 +117,12 @@ func main() {
 
 	switch *mode {
 	case "server":
+		// pprof on its own listener, so a profile can be pulled from the
+		// client machine while a transfer is in flight. The receive side is
+		// the single-core bottleneck at LAN speeds, and it lives here.
+		if *pprofAddr != "" {
+			go func() { log.Println(http.ListenAndServe(*pprofAddr, nil)) }()
+		}
 		if err := runServer(*listen, *verbose); err != nil {
 			log.Fatal(err)
 		}
@@ -94,6 +133,8 @@ func main() {
 		p := preamble{
 			Impl: *impl, Scenario: *scenario,
 			Streams: *streams, Size: *size, YamuxWindow: *ywin,
+			InitWindow: *iw, MaxWindow: *mw, RecvBuf: *rb, MaxFrame: *mf,
+			Priority: *prio,
 		}
 		res, err := runClient(*addr, p, *bytesFlag, *count)
 		if err != nil {
@@ -308,17 +349,34 @@ func (r rawStream) CloseWrite() error {
 	return nil
 }
 
-func portunusConfig() *portunus.Config {
-	// Deliberately the shipped defaults. A benchmark that hand-tunes the
-	// library it is promoting and not the one it compares against is a
-	// press release.
-	return nil
+func portunusConfig(p preamble) *portunus.Config {
+	// With nothing under test this returns nil, which is the shipped
+	// defaults. A benchmark that hand-tunes the library it is promoting and
+	// not the one it compares against is a press release, so the tuning
+	// fields exist only to find better defaults, not to flatter a run.
+	if p.InitWindow == 0 && p.MaxWindow == 0 && p.RecvBuf == 0 && p.MaxFrame == 0 {
+		return nil
+	}
+	cfg := &portunus.Config{}
+	if p.InitWindow > 0 {
+		cfg.InitialWindow = uint32(p.InitWindow)
+	}
+	if p.MaxWindow > 0 {
+		cfg.MaxWindow = uint32(p.MaxWindow)
+	}
+	if p.RecvBuf > 0 {
+		cfg.ReadBufferSize = p.RecvBuf
+	}
+	if p.MaxFrame > 0 {
+		cfg.MaxFrameSize = uint32(p.MaxFrame)
+	}
+	return cfg
 }
 
 func dialSession(c net.Conn, p preamble) (session, error) {
 	switch p.Impl {
 	case "portunus":
-		s, err := portunus.Client(c, portunusConfig())
+		s, err := portunus.Client(c, portunusConfig(p))
 		return portunusSession{s}, err
 	case "yamux":
 		cfg := yamuxConfig(p.YamuxWindow)
@@ -333,7 +391,7 @@ func dialSession(c net.Conn, p preamble) (session, error) {
 func serveSession(c net.Conn, p preamble) (session, error) {
 	switch p.Impl {
 	case "portunus":
-		s, err := portunus.Server(c, portunusConfig())
+		s, err := portunus.Server(c, portunusConfig(p))
 		return portunusSession{s}, err
 	case "yamux":
 		cfg := yamuxConfig(p.YamuxWindow)
@@ -425,9 +483,9 @@ func handle(c net.Conn, verbose bool) error {
 	case "bulk":
 		return serveBulk(ctx, sess, p.Streams)
 	case "rr", "open":
-		return serveEcho(ctx, sess)
+		return serveEcho(ctx, sess, p.Priority)
 	case "rrload":
-		return serveEcho(ctx, sess)
+		return serveEcho(ctx, sess, p.Priority)
 	}
 	return fmt.Errorf("unknown scenario %q", p.Scenario)
 }
@@ -473,7 +531,15 @@ func serveBulk(ctx context.Context, sess session, streams int) error {
 }
 
 // serveEcho answers every stream for as long as the client keeps them open.
-func serveEcho(ctx context.Context, sess session) error {
+//
+// With priority on, it prioritizes the return leg of an interactive stream. A
+// tunnel server does not carry the client's SetPriority call, so it has to
+// classify locally; message size is the honest signal here, since the request
+// stream sends tens of bytes to a few KB while the bulk streams send full
+// blocks. This mirrors what a real proxy would do — treat a stream that only
+// ever carries small messages as interactive — and it is only the return leg;
+// the client prioritizes its own send.
+func serveEcho(ctx context.Context, sess session, priority bool) error {
 	var wg sync.WaitGroup
 	for {
 		st, err := sess.Accept(ctx)
@@ -489,9 +555,39 @@ func serveEcho(ctx context.Context, sess session) error {
 		go func() {
 			defer wg.Done()
 			defer st.Close()
+			if priority {
+				echoClassified(st)
+				return
+			}
 			io.Copy(st, st)
 		}()
 	}
+}
+
+// echoIsSmall is the payload size below which an echoed stream is treated as
+// interactive. Comfortably above the largest rr request (16KB) and below a
+// bulk block (1MB), so the two never cross.
+const echoIsSmall = 32 << 10
+
+// echoClassified echoes a stream, marking it priority for the return leg once
+// it has seen that the stream carries only small messages. It reads the first
+// frame to decide, then copies the rest; a stream whose first message is large
+// is bulk and left unprioritized.
+func echoClassified(st stream) {
+	buf := make([]byte, 64<<10)
+	n, err := st.Read(buf)
+	if n > 0 {
+		if n <= echoIsSmall {
+			setPriority(st, true)
+		}
+		if _, werr := st.Write(buf[:n]); werr != nil {
+			return
+		}
+	}
+	if err != nil {
+		return
+	}
+	io.Copy(st, st)
 }
 
 // awaitPeerHangup blocks until the peer ends the session, using the only
@@ -729,6 +825,13 @@ func roundTrips(ctx context.Context, sess session, p preamble, count int, _ []by
 		return nil, 0, err
 	}
 	defer st.Close()
+
+	// The client's send leg: mark the request stream priority so its frames
+	// are written ahead of any bulk sharing the session. The server does the
+	// same for the return leg once it classifies the stream as interactive.
+	if p.Priority {
+		setPriority(st, true)
+	}
 
 	req := make([]byte, p.Size)
 	resp := make([]byte, p.Size)
