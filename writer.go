@@ -61,7 +61,10 @@ type writer struct {
 
 	// Pending batch. Control frames are staged separately and placed first
 	// in the iovec so a window update is never trapped behind bulk data.
+	// The priority lane sits just after control and ahead of bulk staging,
+	// carrying copied DATA frames from streams marked latency-sensitive.
 	ctl     []byte
+	prio    []byte
 	stage   []byte
 	chunks  []chunk
 	pending int
@@ -105,6 +108,7 @@ type writer struct {
 	// Flusher-owned scratch, swapped with the pending buffers so neither
 	// side allocates in steady state.
 	fctl     []byte
+	fprio    []byte
 	fstage   []byte
 	fchunks  []chunk
 	iov      net.Buffers
@@ -117,9 +121,11 @@ func newWriter(s *NativeSession) *writer {
 		s:       s,
 		flushed: make(chan struct{}),
 		ctl:     make([]byte, 0, 4<<10),
+		prio:    make([]byte, 0, 4<<10),
 		stage:   make([]byte, 0, 64<<10),
 		chunks:  make([]chunk, 0, 64),
 		fctl:    make([]byte, 0, 4<<10),
+		fprio:   make([]byte, 0, 4<<10),
 		fstage:  make([]byte, 0, 64<<10),
 		fchunks: make([]chunk, 0, 64),
 	}
@@ -326,11 +332,25 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 	// heard of as a protocol error. Keeping both in the control area, which
 	// preserves append order, makes that reordering impossible by
 	// construction. It costs one copy on the first frame of each stream.
-	zeroCopy := !syn && !copyOnly && len(payload) >= zeroCopyThreshold
-	if syn {
+	//
+	// A priority stream's later frames go in the priority lane, which the
+	// flusher writes after control and ahead of bulk. Like control it is
+	// copied, so the writer returns as soon as its bytes are staged rather
+	// than parking on a zero-copy reference; a small latency-sensitive frame
+	// was going to be copied anyway. SYN still rides control, which leads
+	// the priority lane, so the announcement cannot be overtaken by the
+	// stream's own later frames. In-stream order holds because every one of
+	// this stream's non-SYN frames takes this same lane, in append order.
+	prio := !syn && st.priority.Load()
+	zeroCopy := !syn && !prio && !copyOnly && len(payload) >= zeroCopyThreshold
+	switch {
+	case syn:
 		w.ctl = append(w.ctl, hdr[:]...)
 		w.ctl = append(w.ctl, payload...)
-	} else {
+	case prio:
+		w.prio = append(w.prio, hdr[:]...)
+		w.prio = append(w.prio, payload...)
+	default:
 		off := int32(len(w.stage))
 		w.stage = append(w.stage, hdr[:]...)
 		if !zeroCopy {
@@ -448,6 +468,7 @@ func (w *writer) flushLoop() {
 		// Swap the pending buffers with the flusher's scratch: neither
 		// side allocates once both have grown to steady-state size.
 		w.fctl, w.ctl = w.ctl, w.fctl[:0]
+		w.fprio, w.prio = w.prio, w.fprio[:0]
 		w.fstage, w.stage = w.stage, w.fstage[:0]
 		w.fchunks, w.chunks = w.chunks, w.fchunks[:0]
 		w.fpingStamp, w.pingStamp = w.pingStamp, false
@@ -502,6 +523,9 @@ func (w *writer) writeOut() error {
 	w.iov = w.iov[:0]
 	if len(w.fctl) > 0 {
 		w.iov = append(w.iov, w.fctl)
+	}
+	if len(w.fprio) > 0 {
+		w.iov = append(w.iov, w.fprio)
 	}
 	for _, c := range w.fchunks {
 		if c.ref != nil {

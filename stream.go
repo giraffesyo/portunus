@@ -36,6 +36,12 @@ type NativeStream struct {
 	batchSeq   uint64
 	batchBytes int
 
+	// priority routes this stream's DATA frames into the batch's priority
+	// lane, which the flusher places ahead of all bulk data. It is atomic
+	// so it can be set from any goroutine and read on the write path without
+	// taking the writer mutex.
+	priority atomic.Bool
+
 	rmu sync.Mutex // serializes Read callers
 	wmu sync.Mutex // serializes Write/CloseWrite callers
 
@@ -398,6 +404,17 @@ func (s *NativeStream) Write(p []byte) (int, error) {
 		p = p[n:]
 	}
 	return total, nil
+}
+
+// SetPriority marks this stream latency-sensitive. Its DATA frames are then
+// written ahead of bulk data in every flush they share, so a small message on
+// this stream is not transmitted behind a batch's worth of another stream's
+// bulk. It affects only the local send direction and may be set at any time.
+//
+// EXPERIMENTAL: this is a prototype for evaluating small-frame prioritization
+// and is not part of the stable API.
+func (s *NativeStream) SetPriority(on bool) {
+	s.priority.Store(on)
 }
 
 // CloseWrite half-closes: FIN rides an empty DATA frame (with SYN if this

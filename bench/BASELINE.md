@@ -424,6 +424,51 @@ yet confirm, and a later change to test. What is settled is the narrower
 point: shrinking the window only trades one axis for the other, so it is not
 the fix.
 
+## Small-frame prioritization: a partial fix, and where the rest of the gap lives
+
+The hypothesis above got built and measured. `Stream.SetPriority` (experimental)
+routes a stream's DATA frames into a priority lane that the flusher writes
+ahead of all bulk in every batch they share, so a small request is not
+transmitted behind a batch's worth of another stream's bulk. The rrload
+harness marks the request stream on both legs: the client on its send, the
+server on its echo, which it classifies by message size the way a real proxy
+would.
+
+WAN path, 55ms, four bulk streams plus the request stream, five interleaved
+reps, median:
+
+| | p50 | p99 | requests/s | bulk load |
+|---|---|---|---|---|
+| priority off | 88.7ms | 225ms | 10.4 | 25.6 MB/s |
+| priority on | 66.3ms | 220ms | 12.0 | 25.5 MB/s |
+
+**p50 falls 25%, and unlike shrinking the window it costs no throughput** —
+bulk load is 25.5 against 25.6, a tie, where dropping to a 256KB window to buy
+the same latency would have halved it. Request rate rises 15%. This is a
+strictly better operating point than the autotuned window alone: same
+throughput, lower median latency.
+
+**It does not close the gap to a small window, and the tail does not move.**
+yamux at 256KB still reaches ~43ms p50; priority gets portunus to 66ms, not
+there. And p99 is unchanged, 220 against 225. Both facts point at the same
+cause: the priority lane reorders frames within *our* group-commit batch, but
+once bytes are handed to the kernel they sit in TCP's send buffer and
+congestion window ahead of anything enqueued after them. A large autotuned
+window keeps ~1MB of bulk in flight on the shared connection, and a small
+request handed to the kernel after it waits behind that on the wire no matter
+what order we wrote it in. That is TCP head-of-line blocking on one flow — the
+known ceiling this library documents as QUIC's genuine advantage — and no
+userspace reordering reaches past it.
+
+So the honest scope: prioritization is a real, throughput-free win on the
+median for a session that mixes a latency-sensitive stream with bulk, and it is
+worth having for exactly that shape of traffic. It is not a substitute for a
+smaller window when the tail is what matters, and it cannot make a shared TCP
+carrier behave like separate connections. Effect size also tracks how much
+queue there is to reorder: on loopback, where the batch is the only queue, a
+co-batched request's p99 roughly halved; on the fast low-RTT LAN, where the
+batch drains before it builds, there was no measurable change.
+
 **The window overshoots, and that costs memory rather than throughput.** This
 path's true bandwidth-delay product is about 1MB; the estimator settles at
 8MB and stops, because the utilization test stops being satisfied. The surplus

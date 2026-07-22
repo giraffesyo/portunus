@@ -54,11 +54,21 @@ design diff), with all surviving amendments folded in.
   are flat. So capping the window buys latency by giving up throughput, not
   for free — an earlier note here claimed throughput was unchanged and was
   wrong. yamux at a 256KB window reaches ~50ms at ~15 MB/s, better on both
-  axes at that point, which says the remaining latency-under-load gap is
-  sender-side scheduling, not window depth: the fix worth building is
-  prioritizing small frames ahead of bulk in group commit, not shrinking the
-  window. Backing autotuning off on delay was rejected regardless, because
-  measuring RTT through our own queues is how bufferbloat spirals start.
+  axes at that point. Backing autotuning off on delay was rejected regardless,
+  because measuring RTT through our own queues is how bufferbloat spirals
+  start.
+- Small-frame prioritization (`Stream.SetPriority`, experimental) is the
+  partial answer to that latency, and its limit is instructive. A priority
+  stream's DATA frames take a lane the flusher writes ahead of bulk, so a
+  small request does not sit behind a batch of another stream's bulk. Measured
+  on the 55ms path it cuts mixed-workload p50 by ~25% at no throughput cost —
+  strictly better than shrinking the window, which pays throughput for the
+  same latency. But it only reorders within our own batch: once bytes reach
+  the kernel they queue in TCP's send buffer and congestion window ahead of
+  anything enqueued later, so a large in-flight window still delays the small
+  request on the wire, the p99 tail does not move, and it does not reach the
+  latency a small window gives. That residual is TCP head-of-line blocking on
+  one flow, the ceiling below, which no userspace scheduling can cross.
 - The window has to be grown, and growing costs round trips. A transfer that
   ends within about five round trips finishes before the window reaches the
   path's bandwidth-delay product, so a correctly pre-configured peer beats
