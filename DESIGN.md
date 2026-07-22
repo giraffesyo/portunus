@@ -45,13 +45,20 @@ design diff), with all surviving amendments folded in.
   sessions; the splice relay path bypasses userspace entirely.
 - One carrier means one TCP flow's congestion window. Striping is a v2
   candidate (see SETTINGS reserved bits).
-- Autotuning sizes the window for throughput, and a window sized for
-  throughput is latency a small request pays when it shares the session with a
-  bulk one. Measured on a real 55ms path rather than argued: p50 roughly
-  doubles against a 256KB window, for bulk throughput that is unchanged once
-  the link is the constraint. The knob is Config.MaxWindow; the alternative —
-  making autotuning back off on delay — was rejected because measuring RTT
-  through our own queues is how bufferbloat spirals start.
+- Autotuning sizes the window for throughput, and on a session that also
+  carries small requests that window is latency they pay. Measured on a real
+  55ms path, `MaxWindow` is a latency/throughput dial rather than a free win:
+  a 256KB window holds small-request p50 near the bare round trip (~50ms) but
+  moves ~11 MB/s of bulk, while the 8MB the autotuner reaches moves ~19 MB/s
+  at ~105ms. The trade lives below about 1MB; from there to 16MB both numbers
+  are flat. So capping the window buys latency by giving up throughput, not
+  for free — an earlier note here claimed throughput was unchanged and was
+  wrong. yamux at a 256KB window reaches ~50ms at ~15 MB/s, better on both
+  axes at that point, which says the remaining latency-under-load gap is
+  sender-side scheduling, not window depth: the fix worth building is
+  prioritizing small frames ahead of bulk in group commit, not shrinking the
+  window. Backing autotuning off on delay was rejected regardless, because
+  measuring RTT through our own queues is how bufferbloat spirals start.
 - The window has to be grown, and growing costs round trips. A transfer that
   ends within about five round trips finishes before the window reaches the
   path's bandwidth-delay product, so a correctly pre-configured peer beats

@@ -21,13 +21,15 @@ type Config struct {
 	// receive window. A window of at least bandwidth × RTT is what keeps a
 	// long path from capping at window/RTT. Default 16MB.
 	//
-	// Lower it for a session that mixes bulk transfer with latency-sensitive
-	// requests. More credit means more data in flight, and on a link that is
-	// already saturated that surplus buys no throughput while the queue it
-	// permits is paid for by every small request behind it: measured on a
-	// 55ms path, four bulk streams pushed small-request p50 from 48ms at a
-	// 256KB window to 104ms at the autotuned one, for bulk throughput that
-	// was the same either way. See bench/BASELINE.md.
+	// On a session that mixes bulk transfer with latency-sensitive requests
+	// this is a latency/throughput dial, not a free win. Measured on a 55ms
+	// path with four bulk streams: a 256KB window holds small-request p50
+	// near the bare round trip (~50ms) but moves ~11 MB/s, while the ~8MB the
+	// autotuner reaches moves ~19 MB/s at ~105ms. The trade lives below about
+	// 1MB; from there to the 16MB default both are flat, so the default is
+	// already in the throughput-favoring region. Lower it to buy latency by
+	// giving up throughput; do not expect the throughput back. See
+	// bench/BASELINE.md.
 	MaxWindow uint32
 
 	// MaxReceiveBudget bounds the total receive credit outstanding across

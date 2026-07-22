@@ -382,22 +382,47 @@ product.
 against bare TCP's 39.0ms. On a real path the multiplexer adds nothing
 measurable to an unloaded round trip.
 
-**Latency under load is the honest weakness, and it is the window's fault.**
-Small requests sharing a session with four bulk streams see p50 rise to 104ms
-against 48ms for stock yamux, and the request rate halve, 8.8/s against 17.7.
-Bulk throughput does not pay for it: 15.9 MB/s against 15.1, which on these
-ranges is a tie. On this path, once four streams are running, the link rather
-than the window is the constraint, so the extra credit buys nothing and the
-queue it permits is pure latency.
+**Latency under load is the honest weakness, and the window is only half of
+it.** Small requests sharing a session with four bulk streams see p50 rise to
+104ms against 48ms for stock yamux, with the request rate halved. A first pass
+here called this purely the window's fault and told operators to cap
+MaxWindow; a follow-up sweep of portunus's own window, holding everything else
+fixed, showed that was too simple and is corrected below.
 
-This is a property of window size rather than of this implementation, which
-the third column establishes: yamux hand-tuned to a comparable window lands in
-the same place — 41ms p50, 7.9 requests/s — and has a distinctly worse tail
-than portunus, 381ms p99 against 207ms. Read the row as "portunus chooses the
-large window automatically and inherits the latency cost that hand-tuning
-yamux would also incur, while handling the tail better than yamux does at that
-size". A deployment mixing bulk transfer with latency-sensitive requests on
-one session should cap MaxWindow rather than accept the autotuned value.
+Window size is a latency/throughput dial, and only below about 1MB. Sweeping
+portunus's MaxWindow on the same 55ms path, three reps, median:
+
+| MaxWindow | p50 | bulk load |
+|---|---|---|
+| 256KB | 50ms | 11 MB/s |
+| 512KB | 69ms | 14 MB/s |
+| 1MB | 106ms | 15 MB/s |
+| 2MB | 96ms | 21 MB/s |
+| 4MB | 86ms | 21 MB/s |
+| 8MB | 111ms | 18 MB/s |
+| 16MB | 105ms | 19 MB/s |
+
+Two things the first pass got wrong. Capping the window does lower latency,
+but not for free: at 256KB, p50 falls to 50ms and bulk load falls with it to
+11 MB/s. The earlier claim that throughput was unchanged compared portunus at
+its autotuned window against yamux at 256KB and mistook a cross-implementation
+tie for a within-implementation one — portunus at 256KB moves 11 MB/s, not the
+15 yamux moves there. And the effect saturates: from 2MB to 16MB, p50 and load
+are both flat, so the 1-to-16MB range the first sweep tested showed nothing
+and led to the wrong "window doesn't matter" conclusion before the sub-1MB
+points were filled in.
+
+What the window cannot explain is the rest of the gap. yamux at a 256KB window
+reaches ~50ms p50 at ~15 MB/s; portunus at 256KB reaches the same latency but
+only 11 MB/s — worse on the throughput axis at the same latency, at the same
+window. That residual is not window depth, since the window is equal. The
+leading suspect is sender-side scheduling — a small request waiting behind
+bulk frames in group commit, and behind echoed bulk on the return path — which
+would point at prioritizing small frames ahead of bulk in the batch as the
+lever to try. That is a hypothesis the measurement here motivates but does not
+yet confirm, and a later change to test. What is settled is the narrower
+point: shrinking the window only trades one axis for the other, so it is not
+the fix.
 
 **The window overshoots, and that costs memory rather than throughput.** This
 path's true bandwidth-delay product is about 1MB; the estimator settles at
