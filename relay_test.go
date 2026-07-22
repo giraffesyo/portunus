@@ -76,6 +76,48 @@ func TestReadFromSendsAllBytes(t *testing.T) {
 	}
 }
 
+// A frame whose payload is larger than the parse buffer is read straight from
+// the kernel into its pooled segment: bufio, asked for more than it holds and
+// with nothing buffered, reads the remainder directly into the destination.
+// The default read buffer is larger than the default frame, so an ordinary
+// session never takes this path; a session configured for large frames or a
+// small buffer does, and it must deliver the same bytes.
+func TestBulkIntactWhenPayloadExceedsReadBuffer(t *testing.T) {
+	// A read buffer far smaller than a frame forces the direct read on every
+	// DATA payload, which is exactly the regime the old 16KB default lived
+	// in and the new default no longer reaches.
+	client, server := pair(t, &Config{ReadBufferSize: 4 << 10})
+	c := ctx(t)
+
+	// Several frames' worth, with a byte pattern that a split or duplicated
+	// read at a frame or buffer boundary would corrupt.
+	payload := make([]byte, 1<<20)
+	for i := range payload {
+		payload[i] = byte(i*7 + i/1023)
+	}
+
+	go func() {
+		st, err := client.OpenStream(c)
+		if err != nil {
+			return
+		}
+		st.Write(payload)
+		st.CloseWrite()
+	}()
+
+	ss, err := server.AcceptStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(ss)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("got %d bytes, want %d; direct read corrupted the stream", len(got), len(payload))
+	}
+}
+
 // The relay path is the design's headline workload: segments received on one
 // session are handed to a stream on another. Ownership must transfer cleanly
 // in both directions of a bidirectional tunnel.

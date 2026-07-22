@@ -411,6 +411,51 @@ every implementation, which is 1/RTT: the benchmark makes each open wait for a
 reply, so on a 55ms path it measures the path and nothing else. The
 zero-syscall open is a syscall-count property and only shows on loopback.
 
+## Read buffer: the default was starving the receiver of syscalls
+
+The two-machine harness made the receive path measurable for the first time. A
+CPU profile of the server during a saturated single-stream transfer on the
+10GbE LAN put 60% of the time in the socket-read syscall, 14% in scheduler
+futex churn, 3% in memmove, and almost nothing in this library's own parsing
+or dispatch. The receive side is one goroutine, and at these rates it is the
+bottleneck, so where that goroutine spends its time is the whole question.
+
+The read buffer defaulted to 16KB, smaller than a 64KB frame. That was
+deliberate — a small buffer lets a large frame's payload go straight from the
+kernel into its pooled segment with no intermediate copy — but it forces a read
+syscall roughly per frame, over a hundred thousand a second at 15 Gbit/s. A
+buffer spanning many frames reads them in one syscall and pays one extra copy
+per payload instead. The profile said syscalls dominate; the measurement
+confirmed it.
+
+Single stream, 512MB, GOMAXPROCS=8, five interleaved reps per size so machine
+drift is shared rather than attributed to one setting:
+
+| read buffer | median Gbit/s | range |
+|---|---|---|
+| 16KB (old default) | 15.9 | 15.4-16.4 |
+| 64KB | 16.4 | 16.1-17.3 |
+| 128KB | 17.2 | 14.8-18.6 |
+| 256KB (new default) | 17.6 | 17.0-20.0 |
+| 512KB | 17.0 | 16.7-17.1 |
+| 1MB | 15.7 | 15.5-17.3 |
+
+The climb is monotonic to 256KB, about 11% over the old default, then flattens
+into noise while the memory keeps growing. 256KB is the knee. The gain is
+larger when the receive core is more contended — an earlier run on a busier
+machine showed 13% — which is the regime a loaded tunnel server is actually in.
+
+Verified not to cost elsewhere: on the 55ms WAN path, where a slow link rarely
+buffers 256KB and the direct read never fired anyway, throughput was unchanged
+(within noise of the 14 MB/s default), and 64-byte round-trip latency was
+unaffected. The read buffer only ever mattered under bandwidth a quiet session
+never reaches.
+
+The cost is one buffer per session rather than per stream. A host terminating
+thousands of mostly-idle sessions holds 256KB for each whether or not it ever
+runs fast enough to benefit, and should lower it; the knob is
+Config.ReadBufferSize.
+
 ## A note on windows
 
 At M4 an experiment showed bulk throughput at 0.50× yamux with mux on its

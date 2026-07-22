@@ -118,10 +118,22 @@ type Config struct {
 	// session ends.
 	WriteTimeout time.Duration
 
-	// ReadBufferSize is the parse buffer for the session reader. It is
-	// deliberately small: a large buffer would slurp bulk payloads into
-	// itself, so the direct kernel-to-segment read for large frames would
-	// almost never fire. Zero selects 16KB.
+	// ReadBufferSize is the parse buffer for the session reader. Zero
+	// selects 256KB.
+	//
+	// The trade is one of syscalls against copies. A small buffer lets the
+	// reader hand a large frame's payload straight from the kernel into its
+	// pooled segment, saving a copy, but it forces a read syscall roughly
+	// per frame: at 15 Gbit/s with 64KB frames that is over a hundred
+	// thousand a second, and measured on a real NIC the syscall overhead
+	// dominates the copy it avoids. A buffer that spans many frames reads
+	// them in one syscall and pays an extra copy per payload, and comes out
+	// about 11% ahead on a saturated link. See bench/BASELINE.md.
+	//
+	// The cost is one buffer per session. A host terminating thousands of
+	// mostly-idle sessions, rather than a few busy ones, may prefer a
+	// smaller value: the syscall savings only materialize under bandwidth a
+	// quiet session never reaches, while the memory is held regardless.
 	ReadBufferSize int
 
 	// MaxBatchBytes bounds one group-commit batch. It caps flush duration
@@ -144,7 +156,7 @@ const (
 	defaultMaxIncoming    = 1024
 	defaultAcceptBacklog  = 128
 	defaultWriteTimeout   = 30 * time.Second
-	defaultReadBufferSize = 16 << 10
+	defaultReadBufferSize = 256 << 10
 	defaultMaxBatchBytes  = 512 << 10
 	defaultMaxWindow      = 16 << 20
 	defaultRecvBudget     = 128 << 20
