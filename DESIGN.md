@@ -337,8 +337,12 @@ portable fallback — an experiment, not a v1 promise.
   one pending-limit cell that the flusher reads as it builds the iovec —
   and merging absolute limits is just `max()`, which eliminates the
   accumulator-zeroing race class entirely. A queue that can fill is a
-  reader-goroutine stall waiting to happen. Updates trigger at half-window
-  consumption. On a pure-receiver session each flush carries every pending
+  reader-goroutine stall waiting to happen. Updates trigger after a quarter
+  of the window drains, not a half: the update takes a round trip to reach the
+  sender, and refreshing at half let the sender spend the rest and stall
+  before it arrived. The quarter trigger measured 87% of the window/RTT
+  ceiling at a fixed window against 67% at half, past yamux's 74%
+  (bench/BASELINE.md). On a pure-receiver session each flush carries every pending
   stream's update in one writev — but it *is* a writev of its own there, so
   the "window updates cost no extra syscall" property is scoped to
   bidirectional traffic.
@@ -575,7 +579,7 @@ Semantics stolen from QUIC deliberately, so the quic-go adapter maps 1:1:
   GOAWAY frame is useless without an entry point that drives it.
 - **Concurrent Read/Write**: `net.Conn` permits concurrent calls;
   per-stream read and write mutexes serialize them — which also makes the
-  consumption accounting single-writer, so the half-window update trigger
+  consumption accounting single-writer, so the quarter-window update trigger
   cannot be raced past and missed permanently.
 - **Reset churn is bounded (Rapid Reset / MadeYouReset class).** An
   incoming stream occupies its `MaxIncomingStreams` slot until the

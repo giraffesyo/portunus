@@ -526,6 +526,52 @@ thousands of mostly-idle sessions holds 256KB for each whether or not it ever
 runs fast enough to benefit, and should lower it; the knob is
 Config.ReadBufferSize.
 
+## Flow-control cadence: why we were slower than yamux at an equal window
+
+The prioritization work exposed a comparison that had been hiding behind
+autotuning. At each library's default, portunus wins bulk by a wide margin
+because it grows the window and yamux does not. But pin both to the same 256KB
+window and yamux was the faster one: single-stream bulk on the 55ms path,
+yamux 3.46 MB/s against portunus 3.12. Same window, same transport, so this
+was ours, not TCP's.
+
+A fixed window caps throughput at window/RTT, and how close you get depends on
+the phase of credit return. The update that grants fresh credit takes a round
+trip to reach the sender, so if it is not sent until half the window has
+drained, the sender spends the second half and then stalls waiting for it.
+Portunus refreshed at half; yamux effectively kept credit topped up sooner.
+Refreshing after only a quarter of the window drains keeps the sender a round
+trip ahead of empty:
+
+| refresh trigger | single-stream MB/s | % of window/RTT ceiling |
+|---|---|---|
+| half drained (old) | 3.12 | 67% |
+| quarter drained (new) | 4.11 | 87% |
+| yamux, for reference | 3.44 | 74% |
+
+Interleaved so the two meet the same path, the quarter trigger is 4.11 against
+yamux's 3.44 — now ahead by 19% at the same window, where it had been 10%
+behind. The mixed workload closes the same way: rrload at an equal 256KB
+window moved 11.8 MB/s before and 14.2 after, level with yamux's 14.5, with
+latency already tied by prioritization (p50 50.7ms against 50.8).
+
+This is what lets portunus claim to beat yamux rather than merely out-configure
+it. At any given window it is now at least yamux's equal on both axes — faster
+on pure bulk, level on mixed — so the throughput advantage at portunus's
+autotuning default is a real gain rather than an artifact of comparing a large
+window against a small one. The remaining default-vs-default latency
+difference (portunus ~95ms, yamux ~50ms in rrload) is that window choice:
+portunus autotunes toward throughput, yamux is fixed at a low-latency,
+low-throughput point, and an operator who wants yamux's latency sets
+MaxWindow to 256KB and now gets yamux's throughput with it.
+
+Cost of the earlier refresh is more WINDOW_UPDATE frames — a quarter trigger
+sends about twice as many as a half — but each is ten bytes, they coalesce
+with return traffic, and at the large windows autotuning reaches the trigger
+fires seldom (a quarter of 8MB is 2MB between updates). Single-stream bulk at
+the autotuned default measured 19.3 Gbit/s on the 10GbE LAN, unchanged from
+before the cadence change, so nothing on the high-bandwidth path regressed.
+
 ## A note on windows
 
 At M4 an experiment showed bulk throughput at 0.50× yamux with mux on its
