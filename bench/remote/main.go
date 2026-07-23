@@ -68,6 +68,7 @@ type preamble struct {
 	MaxFrame   int `json:"mf,omitempty"`
 	MaxBatch   int `json:"mb,omitempty"`
 	NotSent    int `json:"nsl,omitempty"`
+	RecvBudget int `json:"rbg,omitempty"`
 	// Priority marks the latency-sensitive stream of an rr or rrload run as
 	// priority on both ends, so a request frame is written ahead of bulk
 	// rather than behind it. Sent in the preamble so the server prioritizes
@@ -109,6 +110,7 @@ func main() {
 		mf        = flag.Int("max-frame", 0, "portunus MaxFrameSize; 0 = default")
 		mb        = flag.Int("max-batch", 0, "portunus MaxBatchBytes; 0 = default")
 		nsl       = flag.Int("not-sent", 0, "portunus NotSentLowat; 0 = default, negative disables")
+		rbg       = flag.Int("recv-budget", 0, "portunus MaxReceiveBudget; 0 = default")
 		prio      = flag.Bool("priority", false, "portunus: mark the rr/rrload request stream priority")
 	)
 	flag.Parse()
@@ -138,7 +140,7 @@ func main() {
 			Impl: *impl, Scenario: *scenario,
 			Streams: *streams, Size: *size, YamuxWindow: *ywin,
 			InitWindow: *iw, MaxWindow: *mw, RecvBuf: *rb, MaxFrame: *mf,
-			MaxBatch: *mb, NotSent: *nsl,
+			MaxBatch: *mb, NotSent: *nsl, RecvBudget: *rbg,
 			Priority: *prio,
 		}
 		res, err := runClient(*addr, p, *bytesFlag, *count)
@@ -360,7 +362,7 @@ func portunusConfig(p preamble) *portunus.Config {
 	// not the one it compares against is a press release, so the tuning
 	// fields exist only to find better defaults, not to flatter a run.
 	if p.InitWindow == 0 && p.MaxWindow == 0 && p.RecvBuf == 0 &&
-		p.MaxFrame == 0 && p.MaxBatch == 0 && p.NotSent == 0 {
+		p.MaxFrame == 0 && p.MaxBatch == 0 && p.NotSent == 0 && p.RecvBudget == 0 {
 		return nil
 	}
 	cfg := &portunus.Config{}
@@ -381,6 +383,9 @@ func portunusConfig(p preamble) *portunus.Config {
 	}
 	if p.NotSent != 0 {
 		cfg.NotSentLowat = p.NotSent // negative disables; passed through as-is
+	}
+	if p.RecvBudget > 0 {
+		cfg.MaxReceiveBudget = p.RecvBudget
 	}
 	return cfg
 }
