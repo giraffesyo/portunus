@@ -66,6 +66,8 @@ type preamble struct {
 	MaxWindow  int `json:"mw,omitempty"`
 	RecvBuf    int `json:"rb,omitempty"`
 	MaxFrame   int `json:"mf,omitempty"`
+	MaxBatch   int `json:"mb,omitempty"`
+	NotSent    int `json:"nsl,omitempty"`
 	// Priority marks the latency-sensitive stream of an rr or rrload run as
 	// priority on both ends, so a request frame is written ahead of bulk
 	// rather than behind it. Sent in the preamble so the server prioritizes
@@ -105,6 +107,8 @@ func main() {
 		mw        = flag.Int("max-window", 0, "portunus MaxWindow; 0 = default")
 		rb        = flag.Int("recv-buf", 0, "portunus ReadBufferSize; 0 = default")
 		mf        = flag.Int("max-frame", 0, "portunus MaxFrameSize; 0 = default")
+		mb        = flag.Int("max-batch", 0, "portunus MaxBatchBytes; 0 = default")
+		nsl       = flag.Int("not-sent", 0, "portunus NotSentLowat; 0 = default, negative disables")
 		prio      = flag.Bool("priority", false, "portunus: mark the rr/rrload request stream priority")
 	)
 	flag.Parse()
@@ -134,6 +138,7 @@ func main() {
 			Impl: *impl, Scenario: *scenario,
 			Streams: *streams, Size: *size, YamuxWindow: *ywin,
 			InitWindow: *iw, MaxWindow: *mw, RecvBuf: *rb, MaxFrame: *mf,
+			MaxBatch: *mb, NotSent: *nsl,
 			Priority: *prio,
 		}
 		res, err := runClient(*addr, p, *bytesFlag, *count)
@@ -354,7 +359,8 @@ func portunusConfig(p preamble) *portunus.Config {
 	// defaults. A benchmark that hand-tunes the library it is promoting and
 	// not the one it compares against is a press release, so the tuning
 	// fields exist only to find better defaults, not to flatter a run.
-	if p.InitWindow == 0 && p.MaxWindow == 0 && p.RecvBuf == 0 && p.MaxFrame == 0 {
+	if p.InitWindow == 0 && p.MaxWindow == 0 && p.RecvBuf == 0 &&
+		p.MaxFrame == 0 && p.MaxBatch == 0 && p.NotSent == 0 {
 		return nil
 	}
 	cfg := &portunus.Config{}
@@ -369,6 +375,12 @@ func portunusConfig(p preamble) *portunus.Config {
 	}
 	if p.MaxFrame > 0 {
 		cfg.MaxFrameSize = uint32(p.MaxFrame)
+	}
+	if p.MaxBatch > 0 {
+		cfg.MaxBatchBytes = p.MaxBatch
+	}
+	if p.NotSent != 0 {
+		cfg.NotSentLowat = p.NotSent // negative disables; passed through as-is
 	}
 	return cfg
 }
