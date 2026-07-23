@@ -125,6 +125,11 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 		// Best effort: an unsupported kernel just keeps deeper queues.
 		_ = applyNotSentLowat(conn, c.NotSentLowat)
 	}
+	if c.CongestionControl != "" {
+		// Best effort: an algorithm the kernel does not offer is left at
+		// the system default.
+		_ = applyCongestionControl(conn, c.CongestionControl)
+	}
 
 	// The reader starts before the handshake is written. Nothing requires
 	// us to send first, and writing first deadlocks two sessions on any

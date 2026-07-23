@@ -58,6 +58,24 @@ type Config struct {
 	// kernel default. Ignored where the option does not exist.
 	NotSentLowat int
 
+	// CongestionControl selects the carrier's TCP congestion-control
+	// algorithm by name — "bbr", "cubic", "reno" — on Linux, for algorithms
+	// the kernel lets an unprivileged socket set. Empty leaves the system
+	// default; ignored off Linux.
+	//
+	// This is the lever for mixed bulk-and-interactive traffic on one
+	// connection. A loss-based controller (CUBIC) finds its rate by filling
+	// the bottleneck queue, so at a window sized for full throughput a small
+	// request waits behind a full queue no matter how this library schedules
+	// its own frames — the latency wall documented in bench/BASELINE.md that
+	// no window or priority setting on our side can move. BBR paces to keep
+	// roughly a bandwidth-delay product in flight without filling that queue,
+	// which is what lets throughput stay high while the queue, and the
+	// request behind it, stays short. Applied best effort: an algorithm the
+	// kernel does not offer is left at the default and the session still
+	// runs.
+	CongestionControl string
+
 	// StreamIdleTimeout resets streams that have carried no data in either
 	// direction for this long. It is off by default: a quiet stream is
 	// normal for a tunnel holding a connection open, and reaping those

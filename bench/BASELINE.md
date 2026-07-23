@@ -572,6 +572,61 @@ fires seldom (a quarter of 8MB is 2MB between updates). Single-stream bulk at
 the autotuned default measured 19.3 Gbit/s on the 10GbE LAN, unchanged from
 before the cadence change, so nothing on the high-bandwidth path regressed.
 
+## Mixed-workload latency: what is ours to fix, and what is the transport's
+
+Pushing on "then just beat yamux on the mixed workload too" is worth doing
+carefully, because it separates two different things that had been lumped
+together as one latency gap.
+
+The part that was ours we fixed. At an equal window portunus now ties or beats
+yamux on rrload (p50 50.7ms against 50.8, load 14.2 against 14.5), and the
+flow-control and prioritization work above is what closed it. So the "yamux is
+just better here" reading is wrong: at any matched operating point we are at
+least its equal.
+
+The part that is left is not a window setting. Sweeping the aggregate receive
+budget on the 55ms path, four bulk streams plus the request, priority on:
+
+| aggregate budget | p50 | p99 | bulk load |
+|---|---|---|---|
+| ~1MB | 51ms | 124ms | 14.0 MB/s |
+| ~2MB | 63ms | 165ms | 18.0 MB/s |
+| ~3MB | 97ms | 213ms | 14.9 MB/s |
+| default (128MB) | 87ms | 207ms | 19.1 MB/s |
+
+Two readings. First, our default over-provisions: the step from a 2MB cap to
+the 128MB default buys about 1 MB/s of throughput for 20-plus ms of added tail
+— credit granted past what the path can hold, which CUBIC turns into a full
+bottleneck queue and therefore into latency. Capping aggregate credit near the
+path's bandwidth-delay product recovers that. Second, and the reason capping is
+not a clean win either, is that even at the best cap portunus does not drop
+under yamux's ~50ms while keeping its throughput: lower the budget for latency
+and throughput falls with it, exactly as it does for yamux when you shrink its
+window. The two libraries are on the same curve.
+
+That curve is loss-based congestion control, not either library. CUBIC finds
+its sending rate by filling the bottleneck queue until it drops, so any
+configuration fast enough to fill the pipe is also deep enough in the queue to
+delay a small request behind it. yamux's fixed 256KB window sits below that
+point — low latency bought with throughput it leaves on the table. We can sit
+anywhere on the curve; we cannot get off it by choosing a window, and neither
+can yamux.
+
+Getting off it needs a controller that holds a bandwidth-delay product in
+flight without filling the queue. BBR does exactly that, and it is a per-socket
+choice: `Config.CongestionControl` sets TCP_CONGESTION where the kernel allows
+it. Neither benchmark host offered BBR (both listed only reno and cubic, and
+loading the module needs privileges we did not have), so the end-to-end win is
+stated as mechanism rather than measured here — the plumbing is verified to
+set the algorithm per socket and to be a clean no-op where the algorithm is
+absent. On a kernel with BBR in its allowed list, this is the lever that beats
+yamux where a window cannot: full throughput and a shallow queue at once, on
+the same single connection. It is also something yamux has no interface for.
+
+The other escape, one session over several connections so interactive traffic
+does not share a flow with bulk at all, is reserved in SPEC.md (FEATURE_BITS)
+and left for a later version.
+
 ## A note on windows
 
 At M4 an experiment showed bulk throughput at 0.50× yamux with mux on its

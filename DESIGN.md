@@ -64,11 +64,29 @@ design diff), with all surviving amendments folded in.
   on the 55ms path it cuts mixed-workload p50 by ~25% at no throughput cost —
   strictly better than shrinking the window, which pays throughput for the
   same latency. But it only reorders within our own batch: once bytes reach
-  the kernel they queue in TCP's send buffer and congestion window ahead of
+  the kernel they queue in the socket buffer and the bottleneck ahead of
   anything enqueued later, so a large in-flight window still delays the small
   request on the wire, the p99 tail does not move, and it does not reach the
-  latency a small window gives. That residual is TCP head-of-line blocking on
-  one flow, the ceiling below, which no userspace scheduling can cross.
+  latency a small window gives.
+- That residual is bufferbloat, not a fixed law. A loss-based controller
+  (CUBIC) finds its rate by filling the bottleneck queue until it drops, so
+  any window large enough to fill the pipe also runs the queue full, and a
+  small request waits behind it however we schedule our own frames. It is the
+  same curve yamux rides — its fixed 256KB window sits below the queue-filling
+  point, buying latency with the throughput it forgoes; we can sit anywhere on
+  the curve, and this session's measurements confirm no window choice takes
+  either library off it. The controller is what moves it: BBR paces to hold a
+  bandwidth-delay product in flight without filling the queue, so throughput
+  and a shallow queue coexist. `Config.CongestionControl` selects it per
+  socket where the kernel allows (TCP_CONGESTION); see bench/BASELINE.md for
+  the measurement that motivates it and the caveat that no test host offered
+  BBR. Carrying one session over several connections, so interactive traffic
+  never shares a flow with bulk, is the other escape and is a v2 candidate
+  (SPEC.md FEATURE_BITS).
+- The window has to be grown, and growing costs round trips. A transfer that
+  ends within about five round trips finishes before the window reaches the
+  path's bandwidth-delay product, so a correctly pre-configured peer beats
+  autotuning on short transfers over long paths.
 - The window has to be grown, and growing costs round trips. A transfer that
   ends within about five round trips finishes before the window reaches the
   path's bandwidth-delay product, so a correctly pre-configured peer beats
