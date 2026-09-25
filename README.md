@@ -132,4 +132,4 @@ cd bench && go test -bench=. .       # vs tuned yamux
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
