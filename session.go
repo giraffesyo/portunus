@@ -42,7 +42,6 @@ type NativeSession struct {
 	recvTotal atomic.Uint64 // cumulative payload bytes received
 	stalls    atomic.Uint64 // times a sender exhausted its granted credit
 	nextProbe atomic.Uint64 // PING opaque counter
-	lastRecv  atomic.Int64  // UnixNano of the last frame from the peer
 
 	// ctlScratch is reader-owned: control payloads are parsed immediately
 	// and never retained, so one reusable buffer serves them all.
@@ -103,9 +102,7 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 	s.w = newWriter(s)
 	s.bdp = newBDPEstimator(uint64(c.InitialWindow), uint64(c.MaxWindow))
 	s.budget = newBudget(uint64(c.MaxReceiveBudget), uint64(c.MaxWindow))
-	now := time.Now()
-	s.lastRecv.Store(now.UnixNano())
-	s.initAbuseLimits(now)
+	s.initAbuseLimits(time.Now())
 	if client {
 		s.nextID = 1
 	} else {
@@ -160,6 +157,14 @@ func (s *NativeSession) keepaliveLoop() {
 	jitter := time.Duration(uint64(time.Now().UnixNano()) % uint64(interval/4))
 	t := time.NewTimer(interval - interval/8 + jitter)
 	defer t.Stop()
+	// Silence is judged by whether the received-frame counter moved between
+	// ticks, not by a timestamp the reader would have to take on every frame:
+	// a clock read per frame is measurable on the small-message path, and
+	// liveness only needs the resolution of this loop. The cost is that
+	// silence is dated from the tick that last saw progress, so a dead peer
+	// is declared up to one interval later than the timeout strictly says.
+	seen := s.stats.framesReceived.Load()
+	seenAt := time.Now()
 	for {
 		select {
 		case <-s.done:
@@ -167,7 +172,11 @@ func (s *NativeSession) keepaliveLoop() {
 		case <-t.C:
 		}
 		if s.cfg.KeepaliveTimeout > 0 {
-			silent := time.Since(time.Unix(0, s.lastRecv.Load()))
+			now := time.Now()
+			if n := s.stats.framesReceived.Load(); n != seen {
+				seen, seenAt = n, now
+			}
+			silent := now.Sub(seenAt)
 			if silent > s.cfg.KeepaliveTimeout {
 				s.fatal(&SessionError{
 					Code:   CodeInternal,
@@ -231,8 +240,15 @@ func (s *NativeSession) sendProbe() {
 // the fastest honest cadence, and the one that lets the window converge in a
 // handful of round trips instead of tens of timer ticks.
 func (s *NativeSession) maybeProbe() {
+	// Called for every DATA frame, so the common answer — not enough has
+	// arrived since the last probe — is given from one atomic load, without
+	// the clock read and estimator lock the full decision needs.
+	total := s.recvTotal.Load()
+	if !s.bdp.due(total) {
+		return
+	}
 	opaque := s.nextProbe.Add(1)
-	if !s.bdp.shouldProbe(s.recvTotal.Load(), opaque, time.Now()) {
+	if !s.bdp.shouldProbe(total, opaque, time.Now()) {
 		return
 	}
 	var buf [frame.PingLen]byte
@@ -255,13 +271,6 @@ func (s *NativeSession) sendSettings() error {
 	}
 	s.w.appendControl(frame.Header{Type: frame.TypeSettings}, payload)
 	return nil
-}
-
-// writeData queues one DATA frame for st through the group-commit path.
-// copyOnly forces the staging path for streams with an active write
-// deadline, whose caller cannot be pinned in an iovec.
-func (s *NativeSession) writeData(st *NativeStream, payload []byte, flags frame.Flags, copyOnly bool, deadline <-chan struct{}) error {
-	return s.w.appendData(st, payload, flags, copyOnly, deadline)
 }
 
 // streamControl queues a per-stream control frame. A stream whose SYN never
@@ -385,7 +394,7 @@ func (s *NativeSession) readLoop() {
 			return
 		}
 		h := frame.ParseHeader(hdr[:])
-		s.lastRecv.Store(time.Now().UnixNano())
+		// Also the liveness signal: keepaliveLoop watches this counter move.
 		s.stats.framesReceived.Add(1)
 		if h.Length > s.cfg.MaxFrameSize && h.Type == frame.TypeData {
 			s.fatalProtocol(CodeFrameSize, "DATA frame exceeds MaxFrameSize")
@@ -637,6 +646,7 @@ func (s *NativeSession) dispatchStream(h frame.Header, payload []byte, seg pool.
 		// The peer has heard of this stream by definition, so our control
 		// frames for it may go out immediately.
 		st.synSent = true
+		st.announced.Store(true)
 		st.synRecvd = true
 		s.streams[h.StreamID] = st
 		s.incoming++
@@ -751,7 +761,7 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte,
 		return errSessionTerminated
 	}
 	if len(payload) > 0 {
-		st.lastActive.Store(time.Now().UnixNano())
+		st.touch()
 	}
 	s.recvTotal.Add(uint64(len(payload)))
 	s.stats.bytesReceived.Add(uint64(len(payload)))
@@ -775,7 +785,9 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte,
 		st.stalledSinceGrow = true
 	}
 	drop := st.readClosed || st.readErr != nil
-	if !drop && len(payload) > 0 {
+	// A small payload that fits in the tail segment's buffer is copied
+	// there and its own buffer released by the deferred Put; see coalesceMax.
+	if !drop && len(payload) > 0 && !st.appendLocked(payload) {
 		st.rq = append(st.rq, segment{buf: seg, data: payload})
 		queued = true
 	}
@@ -808,7 +820,12 @@ func (s *NativeSession) onData(st *NativeStream, h frame.Header, payload []byte,
 	if len(payload) > 0 {
 		s.maybeProbe()
 	}
-	s.maybeRemove(st)
+	// A DATA frame can only complete a stream by carrying FIN. The dropped
+	// case is kept too: a read side that is already closed may be waiting on
+	// nothing else. Plain data on a live stream skips the second lock.
+	if drop || h.Flags&frame.FlagFIN != 0 {
+		s.maybeRemove(st)
+	}
 	return nil
 }
 

@@ -59,6 +59,22 @@ func (b Buf) Bytes() []byte {
 	return (*b.p)[:b.size:b.size]
 }
 
+// Append copies p into the buffer's unused capacity, directly after what
+// Bytes already exposes, and reports whether it fit. On success Bytes grows
+// by len(p); slices taken from an earlier Bytes call stay valid but do not
+// see the addition. A buffer too full to take p is left untouched.
+//
+// This is what lets many small payloads share one pooled buffer instead of
+// each pinning a whole size class.
+func (b *Buf) Append(p []byte) bool {
+	if b.p == nil || len(p) > cap(*b.p)-b.size {
+		return false
+	}
+	copy((*b.p)[b.size:b.size+len(p)], p)
+	b.size += len(p)
+	return true
+}
+
 // Get returns a buffer of exactly n bytes.
 func Get(n int) Buf {
 	for i, c := range classes {

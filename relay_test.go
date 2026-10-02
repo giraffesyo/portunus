@@ -294,3 +294,68 @@ func TestPooledSegmentsExposeOnlyTheirOwnBytes(t *testing.T) {
 		st.Close()
 	}
 }
+
+// A relay that starts with several segments already waiting hands them to
+// the destination together. They must come out the far end as the bytes that
+// went in, including when the backlog outruns the destination's window.
+func TestRelayBacklogArrivesIntact(t *testing.T) {
+	front, frontSrv := pair(t, &Config{InitialWindow: 2 << 20})
+	back, backSrv := pair(t, nil)
+	c := ctx(t)
+
+	src, err := front.OpenStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, 1500<<10)
+	for i := range want {
+		want[i] = byte(i ^ i>>9)
+	}
+	// Sizes that leave the receiver holding full frames, short frames and
+	// coalesced small ones.
+	go func() {
+		p := want
+		for i := 0; len(p) > 0; i++ {
+			n := min(len(p), []int{200_000, 17, 64 << 10, 3000, 1, 90_000}[i%6])
+			if _, err := src.Write(p[:n]); err != nil {
+				return
+			}
+			p = p[n:]
+		}
+		src.CloseWrite()
+	}()
+
+	in, err := frontSrv.AcceptStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Let a backlog build before the relay starts draining it.
+	deadline := time.Now().Add(5 * time.Second)
+	for frontSrv.Stats().BytesReceived < 1<<20 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	out, err := back.OpenStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		io.Copy(out, in)
+		out.CloseWrite()
+	}()
+
+	sink, err := backSrv.AcceptStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		at := 0
+		for at < len(got) && at < len(want) && got[at] == want[at] {
+			at++
+		}
+		t.Fatalf("relayed %d bytes, want %d; first difference at %d", len(got), len(want), at)
+	}
+}

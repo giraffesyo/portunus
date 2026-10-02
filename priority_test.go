@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"testing"
+	"time"
 )
 
 // A priority stream must still deliver every byte, in order. Prioritization
@@ -25,9 +26,13 @@ func TestPriorityStreamDeliversInOrder(t *testing.T) {
 	// a checksum to notice.
 	const n = 4096
 	want := make([]byte, n)
+	// Filled before the writer starts: the reader compares against it, and
+	// the only thing ordering the two goroutines is the network.
+	for i := range want {
+		want[i] = byte(i*7 + i/251)
+	}
 	go func() {
 		for i := range want {
-			want[i] = byte(i*7 + i/251)
 			if _, err := cs.Write(want[i : i+1]); err != nil {
 				return
 			}
@@ -90,26 +95,34 @@ func TestPriorityFrameRoutesToPriorityLane(t *testing.T) {
 	w := client.w
 
 	// Pin the flusher so appends stage without draining, guaranteeing both
-	// frames share one batch. The announce writes above returned, which for a
-	// lone writer means their inline flush already completed and the flusher
-	// is idle, so this claim is uncontended.
-	w.mu.Lock()
-	if w.flushing {
+	// frames share one batch. The announce writes above returned, so their
+	// inline flushes completed, but the reader may still be flushing a reply
+	// of its own (a PING ACK, a window update), so wait for the flusher to
+	// go idle before claiming it.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		w.mu.Lock()
+		if !w.flushing.Load() {
+			break
+		}
 		w.mu.Unlock()
-		t.Fatal("flusher unexpectedly busy; announce flush should have drained")
+		if time.Now().After(deadline) {
+			t.Fatal("flusher never went idle")
+		}
+		time.Sleep(time.Millisecond)
 	}
-	w.flushing = true
+	w.flushing.Store(true)
 	w.mu.Unlock()
 
 	// Bulk first, then the priority frame: append order that, without the
 	// lane, would put bulk on the wire first. copyOnly keeps the caller from
 	// parking on a zero-copy reference while the flush is pinned.
 	bulkPayload := bytes.Repeat([]byte{0xBB}, 8<<10)
-	if err := w.appendData(bulk.(*NativeStream), bulkPayload, 0, true, nil); err != nil {
+	if _, err := w.appendData(bulk.(*NativeStream), bulkPayload, 0, true, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	prioPayload := bytes.Repeat([]byte{0xAA}, 64)
-	if err := w.appendData(prio.(*NativeStream), prioPayload, 0, true, nil); err != nil {
+	if _, err := w.appendData(prio.(*NativeStream), prioPayload, 0, true, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,7 +131,7 @@ func TestPriorityFrameRoutesToPriorityLane(t *testing.T) {
 	stageLane := append([]byte(nil), w.stage...)
 	// Release the pin and drain, so the streams and session shut down
 	// cleanly rather than leaking a pinned flusher.
-	w.flushing = false
+	w.flushing.Store(false)
 	w.mu.Unlock()
 
 	// The priority payload must be in the priority lane and nowhere else; the

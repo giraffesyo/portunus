@@ -189,3 +189,34 @@ func TestSizeClassSelection(t *testing.T) {
 		Put(b)
 	}
 }
+
+func TestAppendFillsSpareCapacity(t *testing.T) {
+	b := Get(3)
+	copy(b.Bytes(), "abc")
+	if !b.Append([]byte("de")) {
+		t.Fatal("append into spare capacity refused")
+	}
+	if got := string(b.Bytes()); got != "abcde" {
+		t.Fatalf("after append: %q", got)
+	}
+	if n := len(b.Bytes()); cap(b.Bytes()) != n {
+		t.Fatalf("capacity %d exposed past length %d", cap(b.Bytes()), n)
+	}
+	// Fill to the class size exactly, then one byte more must be refused
+	// and leave the buffer as it was.
+	if !b.Append(make([]byte, classes[0]-5)) {
+		t.Fatal("append up to the class size refused")
+	}
+	if b.Append([]byte{1}) {
+		t.Fatal("append past the class size accepted")
+	}
+	if len(b.Bytes()) != classes[0] {
+		t.Fatalf("length %d after refused append, want %d", len(b.Bytes()), classes[0])
+	}
+	Put(b)
+
+	var zero Buf
+	if zero.Append([]byte{1}) {
+		t.Fatal("append to the zero Buf accepted")
+	}
+}

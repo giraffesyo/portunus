@@ -2,6 +2,7 @@ package portunus
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,6 +42,10 @@ type bdpEstimator struct {
 	bdp    uint64  // current estimate, bytes
 
 	maxWindow uint64
+
+	// probeAt mirrors probeFrom plus the byte threshold in shouldProbe, so
+	// the per-frame caller can rule a probe out without taking mu.
+	probeAt atomic.Uint64
 }
 
 // bdpProbeBytes is how much data must arrive before another probe is worth
@@ -48,7 +53,28 @@ type bdpEstimator struct {
 const bdpProbeBytes = 64 << 10
 
 func newBDPEstimator(initial, maxWindow uint64) *bdpEstimator {
-	return &bdpEstimator{bdp: initial, maxWindow: maxWindow}
+	b := &bdpEstimator{bdp: initial, maxWindow: maxWindow}
+	b.setGateLocked()
+	return b
+}
+
+// probeNeedLocked is how much data must arrive after one probe before the
+// next: it scales with the current estimate, so a fixed 64KB threshold does
+// not mean a probe per frame at 64KB frames.
+func (b *bdpEstimator) probeNeedLocked() uint64 {
+	return max(uint64(bdpProbeBytes), b.bdp)
+}
+
+// setGateLocked republishes the byte gate after probeFrom or bdp changes.
+func (b *bdpEstimator) setGateLocked() {
+	b.probeAt.Store(b.probeFrom + b.probeNeedLocked())
+}
+
+// due reports whether enough data has arrived for shouldProbe to be worth
+// asking. It is a lock-free precheck of shouldProbe's byte bound and nothing
+// more; shouldProbe still makes the decision.
+func (b *bdpEstimator) due(recvTotal uint64) bool {
+	return recvTotal >= b.probeAt.Load()
 }
 
 // shouldProbe reports whether enough data has arrived to justify a new
@@ -67,8 +93,7 @@ func (b *bdpEstimator) shouldProbe(recvTotal uint64, opaque uint64, now time.Tim
 	}
 	// Probing is bounded on two axes, and both are needed.
 	//
-	// By bytes: the threshold scales with the current estimate, so a fixed
-	// 64KB threshold does not mean a probe per frame at 64KB frames.
+	// By bytes: see probeNeedLocked.
 	//
 	// By time: no more than one probe per round trip, which is the fastest
 	// cadence that yields an independent sample anyway. Without the time
@@ -76,8 +101,7 @@ func (b *bdpEstimator) shouldProbe(recvTotal uint64, opaque uint64, now time.Tim
 	// second — enough for a correctly-implemented peer to classify us as a
 	// ping flood and close the session, which is exactly what happened
 	// under open-loop load before this existed.
-	need := max(uint64(bdpProbeBytes), b.bdp)
-	if b.probing || recvTotal < b.probeFrom+need {
+	if b.probing || recvTotal < b.probeFrom+b.probeNeedLocked() {
 		return false
 	}
 	if !b.lastProbe.IsZero() && now.Sub(b.lastProbe) < b.minProbeGap() {
@@ -89,6 +113,7 @@ func (b *bdpEstimator) shouldProbe(recvTotal uint64, opaque uint64, now time.Tim
 	b.sampleWait = true
 	b.opaque = opaque
 	b.probeFrom = recvTotal
+	b.setGateLocked()
 	return true
 }
 
@@ -137,6 +162,8 @@ func (b *bdpEstimator) onACK(opaque, recvTotal, stalls uint64, now time.Time) ui
 
 	sample := recvTotal - b.bytesAt
 	b.probeFrom = recvTotal
+	// Deferred: the estimate may still grow below, and the gate depends on it.
+	defer b.setGateLocked()
 	if bw := float64(sample) / rtt.Seconds(); bw > b.bwMax {
 		b.bwMax = bw
 	}

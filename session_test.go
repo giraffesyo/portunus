@@ -629,3 +629,64 @@ func TestCloseWithUnreadDataAndSilentPeer(t *testing.T) {
 		t.Fatal("Close blocked with unread inbound data")
 	}
 }
+
+// Small frames must share receive buffers. Each pooled buffer is a whole size
+// class while flow control counts only payload, so one buffer per frame lets
+// a peer pin a kilobyte of memory per byte of window.
+func TestSmallFramesShareReceiveBuffers(t *testing.T) {
+	client, server := pair(t, nil)
+	c := ctx(t)
+
+	st, err := client.OpenStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const frames = 4000
+	want := make([]byte, 0, frames*3)
+	for i := range frames {
+		msg := []byte{byte(i), byte(i >> 8), 0xA5}
+		want = append(want, msg...)
+		if _, err := st.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+
+	ss, err := server.AcceptStream(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Let everything arrive unread, then count the buffers holding it.
+	rs := ss.(*NativeStream)
+	for {
+		rs.mu.Lock()
+		fin, segs := rs.finRecvd, len(rs.rq)
+		rs.mu.Unlock()
+		if fin {
+			if limit := len(want)/(1<<10) + 2; segs > limit {
+				t.Fatalf("%d bytes in %d frames held in %d buffers, want at most %d", len(want), frames, segs, limit)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Coalescing must not disturb the byte stream, including across a read
+	// that leaves a segment partly consumed.
+	got := make([]byte, 0, len(want))
+	buf := make([]byte, 700)
+	for {
+		n, err := ss.Read(buf)
+		got = append(got, buf[:n]...)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read %d bytes that do not match the %d written", len(got), len(want))
+	}
+}

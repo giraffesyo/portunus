@@ -4,7 +4,9 @@ import (
 	"context"
 	"net"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/giraffesyo/portunus/internal/frame"
@@ -42,6 +44,14 @@ const (
 	// messages always have somewhere to land. It bounds how long a small
 	// write can be held out of the batch currently being assembled.
 	smallWriteReserve = 64 << 10
+
+	// burstFast and burstSlow are the flush durations that grow and shrink
+	// the bulk batch. Between them it holds. A 64KB frame takes about 5ms to
+	// leave on a 100mbit link and 50µs on 10GbE, so links where a frame is
+	// already a noticeable wait stay at one bulk frame per flush and only
+	// carriers that absorb a batch in well under a millisecond get one.
+	burstFast = 500 * time.Microsecond
+	burstSlow = 2 * time.Millisecond
 )
 
 // chunk is one entry in a pending batch: either a reference to caller memory
@@ -51,6 +61,36 @@ type chunk struct {
 	ref []byte
 	off int32
 	n   int32
+}
+
+// shard is one of the staging areas small DATA frames are copied into
+// without the writer mutex. See appendSmall.
+type shard struct {
+	mu      sync.Mutex
+	buf     []byte // whole frames, header and payload, in append order
+	frames  uint64
+	payload uint64
+
+	// Flusher-owned: swapped with buf so neither side allocates in steady
+	// state.
+	fbuf []byte
+
+	_ [64]byte // keep neighboring shards' locks off one cache line
+}
+
+// maxShards bounds the staging shards. Past this, a batch's iovec grows and
+// the flusher's swap lengthens for contention that is already gone.
+const maxShards = 16
+
+// shardCount is the number of staging shards a session gets: enough for one
+// per core up to maxShards, rounded to a power of two so a stream's shard is
+// a mask of its ID.
+func shardCount() uint32 {
+	n := uint32(1)
+	for int(n) < runtime.GOMAXPROCS(0) && n < maxShards {
+		n <<= 1
+	}
+	return n
 }
 
 type writer struct {
@@ -68,6 +108,23 @@ type writer struct {
 	stage   []byte
 	chunks  []chunk
 	pending int
+
+	// shards stage small DATA frames outside mu, and shardBytes counts what
+	// they hold. Everything that asks "is there anything to flush" must add
+	// it to pending. shardCap is how full one shard may get; past it, or
+	// past a full batch overall, writers take the locked path, where
+	// backpressure is applied.
+	shards     []shard
+	shardMask  uint32
+	shardCap   int
+	shardBytes atomic.Int64
+
+	// dataPending is the part of pending that is DATA frames, framing
+	// included. Compared with one stream's share of the batch it says
+	// whether that stream has the batch's data to itself; control frames
+	// are left out because a window update or a PING reply in the batch is
+	// not another stream competing for it.
+	dataPending int
 
 	// frames and payload are counted as the batch is assembled, because a
 	// zero-copy frame contributes two chunks and the iovec carries framing
@@ -88,15 +145,36 @@ type writer struct {
 	doneSeq uint64
 	err     error // sticky: any carrier error is session-fatal
 
-	// flushed is closed when a batch completes and someone is waiting, then
-	// replaced. It is selectable, unlike a sync.Cond, so write deadlines
-	// stay enforceable while waiting. waiters counts parked goroutines so
-	// the uncontended path — one writer, inline flush, nobody parked —
-	// neither closes nor reallocates it.
-	flushed chan struct{}
-	waiters int
+	// seqA, pendingA and failed mirror seq, pending and err != nil for the
+	// fast path, which reads them without mu. All are written only under mu.
+	seqA     atomic.Uint64
+	pendingA atomic.Int64
+	failed   atomic.Bool
 
-	flushing bool
+	// batchDone is closed when the pending batch has been written, and
+	// fbatchDone is the same for the batch in flight. Each exists only if a
+	// zero-copy writer is parked on that batch, so the uncontended path — one
+	// writer, inline flush, nobody parked — allocates nothing. A channel
+	// rather than a sync.Cond so a dying session can be selected against.
+	batchDone  chan struct{}
+	fbatchDone chan struct{}
+
+	// admitQ holds the streams whose writers are parked in admission, in
+	// arrival order; admitting counts writers anywhere in the admission
+	// wait, queued or woken and not yet staged. See admitLocked.
+	admitQ    []*NativeStream
+	admitting int
+
+	// burst is how many frames of bulk a batch may currently hold, sized
+	// from flush duration; see bulkLimitLocked. takeHint is the most a write
+	// can currently expect to have taken in one call, in bytes, published
+	// for Write to size its credit reservation without the lock.
+	burst    int
+	takeHint atomic.Int64
+
+	// flushing is written only under mu. It is atomic so the fast path can
+	// tell, without mu, that a flusher is running and will pick its bytes up.
+	flushing atomic.Bool
 
 	// pingStamp marks a batch as carrying the BDP probe, so the flusher can
 	// timestamp it as it reaches the carrier rather than at enqueue.
@@ -111,6 +189,7 @@ type writer struct {
 	fprio    []byte
 	fstage   []byte
 	fchunks  []chunk
+	fshards  uint32 // bit i set: shard i's fbuf is part of the batch in flight
 	iov      net.Buffers
 	iovOut   net.Buffers // the copy handed to WriteTo; see writeOut
 	coalesce []byte
@@ -119,7 +198,7 @@ type writer struct {
 func newWriter(s *NativeSession) *writer {
 	w := &writer{
 		s:       s,
-		flushed: make(chan struct{}),
+		burst:   1,
 		ctl:     make([]byte, 0, 4<<10),
 		prio:    make([]byte, 0, 4<<10),
 		stage:   make([]byte, 0, 64<<10),
@@ -129,12 +208,20 @@ func newWriter(s *NativeSession) *writer {
 		fstage:  make([]byte, 0, 64<<10),
 		fchunks: make([]chunk, 0, 64),
 	}
+	n := shardCount()
+	w.shards = make([]shard, n)
+	w.shardMask = n - 1
+	// One shard may hold what one stream may put in a batch: it serves a
+	// few streams, and should not take more of the batch than one could.
+	w.shardCap = s.cfg.PerStreamBatchBytes
 	// net.Buffers only becomes writev on an exact *net.TCPConn: the
 	// enabling interface inside net is unexported, so no wrapper can
 	// implement it. Anything else is coalesced into one contiguous write.
 	if tcp, ok := s.conn.(*net.TCPConn); ok {
 		w.tcp = tcp
 	}
+	// One frame until the first flush has measured the carrier.
+	w.takeHint.Store(int64(frame.FloorMaxFrameSize))
 	return w
 }
 
@@ -199,6 +286,7 @@ func (w *writer) stage2(h frame.Header, payload []byte, stamp bool) bool {
 	w.ctl = append(w.ctl, payload...)
 	w.frames++
 	w.pending += frame.HeaderSize + len(payload)
+	w.pendingA.Store(int64(w.pending))
 	return w.claimFlushLocked()
 }
 
@@ -238,6 +326,7 @@ func (w *writer) appendStreamControl(st *NativeStream, h frame.Header, payload [
 	w.ctl = append(w.ctl, payload...)
 	w.frames++
 	w.pending += frame.HeaderSize + len(payload)
+	w.pendingA.Store(int64(w.pending))
 	flush := w.claimFlushLocked()
 	w.mu.Unlock()
 
@@ -250,79 +339,60 @@ func (w *writer) appendStreamControl(st *NativeStream, h frame.Header, payload [
 	}
 }
 
-// appendData queues one DATA frame for st. Small payloads return once
-// staged; large ones park until their flush resolves.
+// appendData queues payload for st as one or more DATA frames and reports how
+// many bytes it took: always at least one frame's worth, and more only when
+// burstFramesLocked allows a write spanning several frames to stage them
+// together. The caller sends the remainder with another call. Small payloads
+// return once staged; large ones park until their flush resolves.
 //
 // SYN is attached if this is the stream's first frame on the wire, decided
 // under w.mu together with the append, so concurrent senders can neither
 // duplicate the SYN nor let a later frame overtake it.
-func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags, copyOnly bool, deadline <-chan struct{}) error {
-	total := frame.HeaderSize + len(payload)
+//
+// more lists whole buffers that may follow payload as frames of their own in
+// the same batch, when payload is a single frame taking the referenced path;
+// how many were taken shows in the count returned. hold stages a copied
+// frame without claiming the flush: the caller undertakes to flush, with
+// another frame or with kick.
+func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags, copyOnly bool, deadline <-chan struct{}, more [][]byte, hold bool) (int, error) {
+	if len(payload) < zeroCopyThreshold && w.appendSmall(st, payload, flags, hold) {
+		return len(payload), nil
+	}
+
+	maxf := int(w.s.peerMaxFrame.Load())
+	first := min(len(payload), maxf)
 
 	w.mu.Lock()
-	// Admission backpressure: bound the batch so flush duration, staging
-	// occupancy, and every co-batched writer's latency floor stay bounded,
-	// and bound each stream's share so a bulk transfer cannot monopolize
-	// consecutive batches. Waiting here is pre-admission, so write
-	// deadlines legally apply.
-	for w.err == nil && w.admissionBlockedLocked(st, total) {
-		if flush := w.claimFlushLocked(); flush {
-			w.mu.Unlock()
-			w.flushLoop()
-			w.mu.Lock()
-			continue
-		}
-		// Registered before unlocking, so the flusher cannot decide
-		// "nobody is waiting" and skip the wakeup we are about to await.
-		w.s.stats.admissionWaits.Add(1)
-		w.waiters++
-		ch := w.flushed
-		w.mu.Unlock()
-		var err error
-		select {
-		case <-ch:
-		case <-deadline:
-			err = os.ErrDeadlineExceeded
-		case <-w.s.done:
-			err = w.s.closedErr()
-		}
-		w.mu.Lock()
-		w.waiters--
-		if err != nil {
-			w.mu.Unlock()
-			return err
-		}
+	// Admission is decided on the first frame alone, so a long write waits
+	// for exactly what a single frame would and is never held out for
+	// wanting more.
+	woken, err := w.admitLocked(st, frame.HeaderSize+first, deadline)
+	if err != nil {
+		return 0, err
 	}
-	if w.err != nil {
-		err := w.err
-		w.mu.Unlock()
-		return err
-	}
-
-	if st.batchSeq != w.seq+1 {
-		st.batchSeq = w.seq + 1 // batchSeq 0 means "no batch", so offset by one
-		st.batchBytes = 0
-	}
-	st.batchBytes += total
 
 	if st.sendAborted.Load() {
 		// Abandoned while this write was in flight. Staging now would
 		// announce a stream the peer can never be told about.
+		if woken {
+			w.passAdmitLocked()
+		}
 		w.mu.Unlock()
-		return ErrStreamClosed
+		return 0, ErrStreamClosed
 	}
 
 	syn := !st.synSent
 	if syn {
 		flags |= frame.FlagSYN
 		st.synSent = true
+		st.announced.Store(true)
 	}
 	var hdr [frame.HeaderSize]byte
 	frame.Header{
 		Type:     frame.TypeData,
 		Flags:    flags,
 		StreamID: st.id,
-		Length:   uint32(len(payload)),
+		Length:   uint32(first),
 	}.Encode(hdr[:])
 
 	// The frame announcing a stream goes in the control area rather than
@@ -342,31 +412,100 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 	// stream's own later frames. In-stream order holds because every one of
 	// this stream's non-SYN frames takes this same lane, in append order.
 	prio := !syn && st.priority.Load()
-	zeroCopy := !syn && !prio && !copyOnly && len(payload) >= zeroCopyThreshold
+	zeroCopy := !syn && !prio && !copyOnly && first >= zeroCopyThreshold
+
+	// A small frame that reached the locked path — its shard was full, the
+	// batch was, or no flusher was running when it looked — still goes to
+	// its shard if a flusher is running now and the stream has nothing in
+	// this batch's main lane. Staging it in the main lane instead would
+	// commit the stream to the locked path for the rest of the batch, and
+	// under contention the wait for this mutex outlasts a batch, so the
+	// next write would arrive to find itself committed again: measured,
+	// half of all small writes were stuck here that way.
+	inBatch := st.batchSeq.Load() == w.seq+1
+	if !syn && !prio && !inBatch && first < zeroCopyThreshold && w.flushing.Load() &&
+		w.shardAppend(st, &hdr, payload[:first]) {
+		// The flusher re-reads shardBytes under mu before it may exit, and
+		// we hold mu, so these bytes cannot be stranded.
+		w.mu.Unlock()
+		return first, nil
+	}
+	if !inBatch {
+		st.batchSeq.Store(w.seq + 1) // batchSeq 0 means "no batch", so offset by one
+		st.batchBytes = 0
+	}
+
+	take, frames := first, 1
 	switch {
 	case syn:
 		w.ctl = append(w.ctl, hdr[:]...)
-		w.ctl = append(w.ctl, payload...)
+		w.ctl = append(w.ctl, payload[:first]...)
 	case prio:
 		w.prio = append(w.prio, hdr[:]...)
-		w.prio = append(w.prio, payload...)
-	default:
+		w.prio = append(w.prio, payload[:first]...)
+	case !zeroCopy:
 		off := int32(len(w.stage))
 		w.stage = append(w.stage, hdr[:]...)
-		if !zeroCopy {
-			w.stage = append(w.stage, payload...)
-		}
+		w.stage = append(w.stage, payload[:first]...)
 		w.chunks = append(w.chunks, chunk{off: off, n: int32(len(w.stage)) - off})
-		if zeroCopy {
-			w.chunks = append(w.chunks, chunk{ref: payload})
+	case len(more) > 0 && flags == 0:
+		// A frame followed by other buffers, each a frame of its own.
+		frames = w.burstFramesLocked(st, (1+len(more))*maxf, maxf)
+		off := int32(len(w.stage))
+		w.stage = append(w.stage, hdr[:]...)
+		w.chunks = append(w.chunks, chunk{off: off, n: frame.HeaderSize}, chunk{ref: payload[:first]})
+		for _, b := range more[:frames-1] {
+			frame.Header{
+				Type:     frame.TypeData,
+				StreamID: st.id,
+				Length:   uint32(len(b)),
+			}.Encode(hdr[:])
+			off := int32(len(w.stage))
+			w.stage = append(w.stage, hdr[:]...)
+			w.chunks = append(w.chunks, chunk{off: off, n: frame.HeaderSize}, chunk{ref: b})
+			take += len(b)
+		}
+	default:
+		// Flags describe the write as a whole, so a flagged payload stays
+		// one frame; Write never passes any.
+		if len(payload) > maxf && flags == 0 {
+			frames = w.burstFramesLocked(st, len(payload), maxf)
+			take = min(len(payload), frames*maxf)
+		}
+		for sent := 0; sent < take; sent += maxf {
+			part := payload[sent:min(sent+maxf, take)]
+			if sent > 0 {
+				frame.Header{
+					Type:     frame.TypeData,
+					StreamID: st.id,
+					Length:   uint32(len(part)),
+				}.Encode(hdr[:])
+			}
+			off := int32(len(w.stage))
+			w.stage = append(w.stage, hdr[:]...)
+			w.chunks = append(w.chunks, chunk{off: off, n: frame.HeaderSize}, chunk{ref: part})
 		}
 	}
-	w.frames++
-	w.payload += uint64(len(payload))
+	total := take + frames*frame.HeaderSize
+	st.batchBytes += total
+	w.frames += uint64(frames)
+	w.payload += uint64(take)
 	w.pending += total
+	w.pendingA.Store(int64(w.pending))
+	w.dataPending += total
 
 	mySeq := w.seq
-	flush := w.claimFlushLocked()
+	flush := !hold && w.claimFlushLocked()
+	// A referenced payload that someone else will flush is waited for on the
+	// batch's own channel, so the writer wakes when its batch resolves and
+	// not on every flush before it.
+	var done chan struct{}
+	if zeroCopy && !flush {
+		if w.batchDone == nil {
+			w.batchDone = make(chan struct{})
+		}
+		done = w.batchDone
+	}
 	w.mu.Unlock()
 
 	if flush {
@@ -375,61 +514,426 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 	if !zeroCopy {
 		// Bytes are session-owned: the caller may reuse its buffer, and
 		// any error surfaces on a later call.
-		return nil
+		return take, nil
 	}
 
 	// Park until the flush carrying this payload resolves. There is no
 	// deadline case here: a stream with an active write deadline took the
 	// copy path above.
-	w.mu.Lock()
-	for w.doneSeq <= mySeq && w.err == nil {
-		w.waiters++
-		ch := w.flushed
-		w.mu.Unlock()
-		var dead bool
+	if done != nil {
 		select {
-		case <-ch:
+		case <-done:
 		case <-w.s.done:
-			dead = true
-		}
-		w.mu.Lock()
-		w.waiters--
-		if dead && w.err == nil {
-			w.err = w.s.closedErr()
 		}
 	}
-	err := w.err
+	w.mu.Lock()
+	if w.doneSeq <= mySeq && w.err == nil {
+		// Only a dying session leaves a batch unresolved: either it was
+		// seen above, or our own flushLoop returned early on it.
+		if w.err = w.s.closedErr(); w.err == nil {
+			w.err = ErrSessionClosed
+		}
+		w.failed.Store(true)
+	}
+	err = w.err
 	w.mu.Unlock()
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return take, nil
+}
+
+// appendSmall is the fast path for a small DATA frame: it copies the frame
+// into the stream's staging shard under that shard's lock alone, and reports
+// false if the frame has to take the locked path instead.
+//
+// With many streams sending small messages the writer mutex was the whole
+// cost: a profile of 64 streams on 18 cores put half of all CPU in
+// appendData, nearly all of it acquiring and handing off that one lock. A
+// small frame needs almost nothing the mutex protects. Its bytes are copied,
+// so it waits on no flush; once the stream is announced there is no SYN to
+// decide; and admission only matters when the batch is full. So it is staged
+// in one of a handful of shards, each with its own lock, which the flusher
+// gathers when it swaps the batch out. Writers on different shards no longer
+// meet at all.
+//
+// What keeps that correct:
+//
+//   - Order within a stream. A stream always uses the same shard, and shards
+//     are written after control and priority and before the main data lane.
+//     So a small frame may not go to a shard while the stream has frames in
+//     the main lane of the same pending batch, or it would overtake them;
+//     that is the batchSeq test. The reverse — main lane after shard — is
+//     already in order. The flusher gathers the shards while holding mu, in
+//     the same critical section that swaps the main lanes and before it
+//     publishes the new batch number, so a stream's earlier frame can never
+//     be left behind for a later batch than its next, and a stream held to
+//     the main lane stays held until its shard has been emptied.
+//   - No stranded bytes. A frame staged here has no flusher of its own. The
+//     writer publishes its bytes and then looks for a flusher; the flusher
+//     clears its flag and then looks for bytes (see flushLoop). Whichever
+//     runs second sees the other.
+//   - Backpressure. A shard holds a bounded amount and the batch as a whole
+//     is bounded; past either, writers take the locked path, where a full
+//     batch makes them wait.
+func (w *writer) appendSmall(st *NativeStream, payload []byte, flags frame.Flags, hold bool) bool {
+	// With no flush in flight this writer would become the flusher anyway,
+	// and the locked path stages and claims in one acquisition; the detour
+	// through a shard would only add locks to the idle round trip.
+	if !w.flushing.Load() {
+		return false
+	}
+	if !st.announced.Load() || st.priority.Load() || st.sendAborted.Load() || w.failed.Load() {
+		return false
+	}
+	if st.batchSeq.Load() == w.seqA.Load()+1 {
+		return false
+	}
+	// The batch bound, read without the lock: it can be overshot by the
+	// few frames that race past it, never by more.
+	if int(w.pendingA.Load()+w.shardBytes.Load())+frame.HeaderSize+len(payload) > w.s.cfg.MaxBatchBytes {
+		return false
+	}
+	var hdr [frame.HeaderSize]byte
+	frame.Header{
+		Type:     frame.TypeData,
+		Flags:    flags,
+		StreamID: st.id,
+		Length:   uint32(len(payload)),
+	}.Encode(hdr[:])
+	if !w.shardAppend(st, &hdr, payload) {
+		return false
+	}
+
+	if !hold && !w.flushing.Load() {
+		w.mu.Lock()
+		flush := w.claimFlushLocked()
+		w.mu.Unlock()
+		if flush {
+			w.flushLoop()
+		}
+	}
+	return true
+}
+
+// shardAppend copies one encoded frame into st's shard, reporting false if
+// the shard is full. It takes only the shard's lock; callers may or may not
+// hold mu.
+func (w *writer) shardAppend(st *NativeStream, hdr *[frame.HeaderSize]byte, payload []byte) bool {
+	total := frame.HeaderSize + len(payload)
+	sh := &w.shards[st.shard]
+	sh.mu.Lock()
+	if len(sh.buf)+total > w.shardCap {
+		sh.mu.Unlock()
+		return false
+	}
+	sh.buf = append(sh.buf, hdr[:]...)
+	sh.buf = append(sh.buf, payload...)
+	sh.frames++
+	sh.payload += uint64(len(payload))
+	// Published inside the shard lock, where the flusher also takes it
+	// back, so the count never disagrees with what the shards hold.
+	w.shardBytes.Add(int64(total))
+	sh.mu.Unlock()
+	return true
+}
+
+// gatherShardsLocked moves what the shards hold into the flusher's buffers
+// and returns the byte count. Called with mu held, in the same critical
+// section that swaps the main lanes; appendSmall's ordering argument depends
+// on that.
+func (w *writer) gatherShardsLocked() int {
+	w.fshards = 0
+	if w.shardBytes.Load() == 0 {
+		// The common case on a bulk-only session: not one shard lock taken.
+		return 0
+	}
+	n := 0
+	for i := range w.shards {
+		sh := &w.shards[i]
+		sh.mu.Lock()
+		if len(sh.buf) > 0 {
+			n += len(sh.buf)
+			w.fshards |= 1 << i
+			sh.fbuf, sh.buf = sh.buf, sh.fbuf[:0]
+			w.frames += sh.frames
+			w.payload += sh.payload
+			sh.frames, sh.payload = 0, 0
+		}
+		sh.mu.Unlock()
+	}
+	w.shardBytes.Add(int64(-n))
+	return n
+}
+
+// admitLocked waits until the pending batch can take total more bytes from
+// st. It is called with w.mu held and returns with it held, except on error,
+// when it has been released. woken reports that this caller was handed room
+// by wakeAdmitLocked, so a caller that then stages nothing must pass it on.
+//
+// Admission backpressure bounds the batch so flush duration, staging
+// occupancy, and every co-batched writer's latency floor stay bounded, and
+// bounds each stream's share so a bulk transfer cannot monopolize consecutive
+// batches. Waiting here is pre-admission, so write deadlines legally apply.
+//
+// Waiters queue in arrival order and are woken when a batch is swapped out
+// for flushing — the moment room appears — and only as many as the new batch
+// can hold. Waking everyone when a flush completed had both parts wrong:
+// room had been free for the whole writev with the waiters still asleep, so
+// the flusher's next swap raced them and took a nearly empty batch; and all
+// of them woke to contend for room a few could use, measured at 3.5 parks
+// per frame with 64 bulk writers.
+func (w *writer) admitLocked(st *NativeStream, total int, deadline <-chan struct{}) (woken bool, err error) {
+	waiting := false
+	for w.err == nil && w.admissionBlockedLocked(st, total) {
+		if w.claimFlushLocked() {
+			w.mu.Unlock()
+			w.flushLoop()
+			w.mu.Lock()
+			continue
+		}
+		if !waiting {
+			waiting = true
+			w.admitting++
+		}
+		w.s.stats.admissionWaits.Add(1)
+		if st.admitCh == nil {
+			st.admitCh = make(chan struct{}, 1)
+		}
+		st.admitNeed = total
+		// Queued before unlocking, so the flusher's next swap cannot miss
+		// it. A waiter that was woken and then lost its room to a newcomer
+		// keeps its place at the head rather than starting over.
+		w.enqueueAdmitLocked(st, woken)
+		w.mu.Unlock()
+		var werr error
+		select {
+		case <-st.admitCh:
+		case <-deadline:
+			werr = os.ErrDeadlineExceeded
+		case <-w.s.done:
+			werr = w.s.closedErr()
+		}
+		w.mu.Lock()
+		if werr != nil {
+			if !w.dequeueAdmitLocked(st) {
+				// Woken and gave up in the same instant: the room it was
+				// handed must not be lost with it.
+				select {
+				case <-st.admitCh:
+				default:
+				}
+				w.passAdmitLocked()
+			}
+			w.admitting--
+			w.mu.Unlock()
+			return false, werr
+		}
+		woken = true
+	}
+	if waiting {
+		w.admitting--
+	}
+	if w.err != nil {
+		err := w.err
+		w.mu.Unlock()
+		return false, err
+	}
+	return woken, nil
+}
+
+// enqueueAdmitLocked parks st in the admission queue, at the head if it is
+// returning after a wake that yielded nothing.
+func (w *writer) enqueueAdmitLocked(st *NativeStream, front bool) {
+	st.admitQueued = true
+	if !front {
+		w.admitQ = append(w.admitQ, st)
+		return
+	}
+	w.admitQ = append(w.admitQ, nil)
+	copy(w.admitQ[1:], w.admitQ)
+	w.admitQ[0] = st
+}
+
+// dequeueAdmitLocked removes st from the admission queue, reporting false if
+// it was no longer there — that is, if it had already been woken.
+func (w *writer) dequeueAdmitLocked(st *NativeStream) bool {
+	if !st.admitQueued {
+		return false
+	}
+	st.admitQueued = false
+	for i, q := range w.admitQ {
+		if q == st {
+			copy(w.admitQ[i:], w.admitQ[i+1:])
+			w.admitQ[len(w.admitQ)-1] = nil
+			w.admitQ = w.admitQ[:len(w.admitQ)-1]
+			break
+		}
+	}
+	return true
+}
+
+// wakeAdmitLocked releases waiters from the head of the queue until their
+// first frames would fill a batch. Called when the pending batch has just
+// been emptied. At least one is always woken, since an empty batch admits
+// anything.
+func (w *writer) wakeAdmitLocked() {
+	room := w.bulkLimitLocked()
+	n := 0
+	for n < len(w.admitQ) {
+		st := w.admitQ[n]
+		if n > 0 && st.admitNeed > room {
+			break
+		}
+		room -= st.admitNeed
+		st.admitQueued = false
+		// Never blocks: the channel holds one token and a stream has one
+		// writer in admission at a time.
+		select {
+		case st.admitCh <- struct{}{}:
+		default:
+		}
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	k := copy(w.admitQ, w.admitQ[n:])
+	clear(w.admitQ[k:])
+	w.admitQ = w.admitQ[:k]
+}
+
+// passAdmitLocked hands on a wake its holder could not use. Waiters are only
+// woken by a swap, and a swap only happens with something staged, so a woken
+// writer that leaves without staging would otherwise strand everyone queued
+// behind it with nothing left to trigger the next wake.
+func (w *writer) passAdmitLocked() {
+	if w.pending == 0 && w.shardBytes.Load() == 0 {
+		w.wakeAdmitLocked()
+	}
+}
+
+// bulkCap is the most bulk data a batch may ever hold: the configured batch
+// size less the room kept for small writes.
+//
+// Bulk writes must leave headroom that only small writes may use, so a
+// latency-sensitive message can always join the batch being assembled
+// instead of queueing behind a batch's worth of bulk data. Without the
+// reservation, small writers lose the admission race to a handful of
+// saturating bulk writers until the runtime's mutex starvation mode forces a
+// handoff — which showed up as a millisecond of added tail latency, an order
+// of magnitude worse than the batch itself.
+//
+// It never reserves so much that bulk cannot batch at all: a small
+// MaxBatchBytes (permitted down to one max frame) minus a fixed reserve goes
+// negative, which would block every bulk write behind a full drain and
+// reduce group commit to one frame per syscall.
+func (w *writer) bulkCap() int {
+	return max(w.s.cfg.MaxBatchBytes-smallWriteReserve, int(w.s.cfg.MaxFrameSize)+frame.HeaderSize)
+}
+
+// bulkLimitLocked is the batch size bulk writes are admitted against right
+// now: w.burst frames, within bulkCap.
+//
+// The configured batch size is a bound on flush duration — every co-batched
+// writer's latency floor — but it is stated in bytes, and what a byte costs
+// in time is the carrier's business: 448KB is a third of a millisecond on
+// 10GbE and eighteen on a 200mbit path. So bulk is admitted against a limit
+// that adaptBurstLocked sizes from how long flushes are actually taking. On
+// a fast carrier it sits at the cap and batches fill; on a slow one it comes
+// down to a single frame, and a small write arriving mid-flush waits for one
+// frame to leave rather than a batch of them. Small writes are not subject
+// to it: they are what it protects.
+func (w *writer) bulkLimitLocked() int {
+	per := int(w.s.peerMaxFrame.Load()) + frame.HeaderSize
+	return max(per, min(w.bulkCap(), w.burst*per))
+}
+
+// burstFramesLocked decides how many frames of an n-byte write may be staged
+// together, given that the first has been admitted.
+//
+// A write spanning several frames used to cost a syscall per frame even with
+// the session to itself: each frame was staged, flushed inline and waited
+// for before the next was looked at, so a lone bulk stream never batched with
+// itself. Staging them together is the same lever as a larger frame size
+// (about a quarter more throughput on writes of several frames) without
+// asking the peer to accept larger frames.
+//
+// With other streams' data in the batch or waiting for it, the stream gets
+// its configured share and no more, exactly as if its frames had arrived one
+// at a time. With the batch to itself it may fill it. Either way the batch
+// is bounded by bulkLimitLocked, so on a carrier too slow to absorb a burst
+// quickly this comes to one frame and behavior is unchanged.
+func (w *writer) burstFramesLocked(st *NativeStream, n, maxf int) int {
+	per := maxf + frame.HeaderSize
+	limit := w.bulkLimitLocked()
+	share := w.s.cfg.PerStreamBatchBytes
+	if w.admitting == 0 && w.dataPending == st.batchBytes && w.shardBytes.Load() == 0 {
+		share = limit
+	}
+	room := min(limit-w.dataPending, share-st.batchBytes)
+	return max(1, min(room/per, (n+maxf-1)/maxf))
+}
+
+// adaptBurstLocked resizes the bulk batch after a flush of n bytes that took
+// d. A flush the carrier absorbed quickly doubles it, provided the flush was
+// large enough to have tested the current size; a slow one halves it. The
+// thresholds are in time rather than bytes because time is what a writer
+// arriving mid-flush pays.
+func (w *writer) adaptBurstLocked(n int, d time.Duration) {
+	maxf := int(w.s.peerMaxFrame.Load())
+	per := maxf + frame.HeaderSize
+	switch {
+	case d > burstSlow:
+		w.burst = max(1, w.burst/2)
+	case d <= burstFast && n >= w.burst*maxf/2:
+		w.burst = min(w.burst*2, max(1, w.bulkCap()/per))
+	}
+	// Republished every time, not only on a change: the peer's frame size
+	// arrives with its SETTINGS, after the first flush has already run.
+	w.takeHint.Store(int64(w.bulkLimitLocked() / per * maxf))
 }
 
 // admissionBlockedLocked reports whether this write must wait for the
 // pending batch to flush: either the batch is full, or this stream has
-// already used its share of it. An empty batch always admits, so a single
-// oversized write can never deadlock against its own cap.
+// already used its share of it. A batch with no data in it always admits, so
+// a single oversized write can never deadlock against its own cap.
 func (w *writer) admissionBlockedLocked(st *NativeStream, total int) bool {
-	if w.pending == 0 {
+	shards := int(w.shardBytes.Load())
+	if w.pending == 0 && shards == 0 {
 		return false
 	}
-	// Bulk writes must leave headroom that only small writes may use, so a
-	// latency-sensitive message can always join the batch being assembled
-	// instead of queueing behind a batch's worth of bulk data. Without the
-	// reservation, small writers lose the admission race to a handful of
-	// saturating bulk writers until the runtime's mutex starvation mode
-	// forces a handoff — which showed up as a millisecond of added tail
-	// latency, an order of magnitude worse than the batch itself.
-	limit := w.s.cfg.MaxBatchBytes
+	// Bulk is held to a smaller batch than small writes, sized from how fast
+	// the carrier is taking flushes; see bulkLimitLocked.
+	//
+	// The bulk limit counts data only. Control frames never wait on a cap
+	// and are not what it bounds; counting them would hold a bulk frame out
+	// of a one-frame batch for a whole flush whenever a window update
+	// happened to be staged first.
 	if total > zeroCopyThreshold {
-		// Never reserve so much that bulk cannot batch at all: a small
-		// MaxBatchBytes (permitted down to one max frame) minus a fixed
-		// reserve goes negative, which would block every bulk write behind
-		// a full drain and reduce group commit to one frame per syscall.
-		limit = max(limit-smallWriteReserve, int(w.s.cfg.MaxFrameSize)+frame.HeaderSize)
-	}
-	if w.pending+total > limit {
+		if w.dataPending > 0 && w.dataPending+total > w.bulkLimitLocked() {
+			return true
+		}
+	} else if w.pending+shards+total > w.s.cfg.MaxBatchBytes {
 		return true
 	}
-	return st.batchSeq == w.seq+1 && st.batchBytes+total > w.s.cfg.PerStreamBatchBytes
+	return st.batchSeq.Load() == w.seq+1 && st.batchBytes+total > w.s.cfg.PerStreamBatchBytes
+}
+
+// kick flushes whatever is staged if nobody is. It is the second half of a
+// held append.
+func (w *writer) kick() {
+	// Staged bytes are already published, so a flusher seen running here
+	// will see them before it may exit.
+	if w.flushing.Load() {
+		return
+	}
+	w.mu.Lock()
+	flush := w.claimFlushLocked()
+	w.mu.Unlock()
+	if flush {
+		w.flushLoop()
+	}
 }
 
 // claimFlushLocked makes the caller the flusher when none is running and
@@ -437,10 +941,10 @@ func (w *writer) admissionBlockedLocked(st *NativeStream, total int) bool {
 // session has no data writers, so window updates would otherwise never reach
 // the wire and the transfer would deadlock once the initial window drained.
 func (w *writer) claimFlushLocked() bool {
-	if w.flushing || w.pending == 0 || w.err != nil {
+	if w.flushing.Load() || w.err != nil || (w.pending == 0 && w.shardBytes.Load() == 0) {
 		return false
 	}
-	w.flushing = true
+	w.flushing.Store(true)
 	return true
 }
 
@@ -456,14 +960,32 @@ func (w *writer) flushLoop() {
 	defer w.s.recoverPanic("session flusher")
 	for {
 		w.mu.Lock()
-		if w.pending == 0 || w.err != nil {
-			w.flushing = false
-			w.wakeLocked()
+		if w.err != nil {
+			w.flushing.Store(false)
 			w.mu.Unlock()
 			return
 		}
+		if w.pending == 0 && w.shardBytes.Load() == 0 {
+			// Clear the flag first and look again second. A fast-path writer
+			// publishes its bytes and then checks the flag, so one of us is
+			// bound to see the other: either it finds no flusher and claims
+			// the duty itself, or its bytes are visible here.
+			w.flushing.Store(false)
+			if w.shardBytes.Load() == 0 {
+				w.mu.Unlock()
+				return
+			}
+			w.flushing.Store(true)
+		}
+		// Gather the shards before the batch number moves on. A stream with
+		// main-lane data in this batch is kept off its shard by that number;
+		// publishing the new one first would let its next small frame into
+		// a shard that is still to be gathered, and so into this batch
+		// ahead of the main-lane data it follows.
+		n := w.gatherShardsLocked()
 		seq := w.seq
 		w.seq++
+		w.seqA.Store(w.seq)
 
 		// Swap the pending buffers with the flusher's scratch: neither
 		// side allocates once both have grown to steady-state size.
@@ -472,25 +994,41 @@ func (w *writer) flushLoop() {
 		w.fstage, w.stage = w.stage, w.fstage[:0]
 		w.fchunks, w.chunks = w.chunks, w.fchunks[:0]
 		w.fpingStamp, w.pingStamp = w.pingStamp, false
+		w.fbatchDone, w.batchDone = w.batchDone, nil
+		n += w.pending
 		w.fframes, w.frames = w.frames, 0
 		w.fpayload, w.payload = w.payload, 0
 		w.pending = 0
+		w.pendingA.Store(0)
+		w.dataPending = 0
+		// The new batch is empty: this, not the end of the flush, is when
+		// writers held out by a full batch can be let in.
+		w.wakeAdmitLocked()
 		w.mu.Unlock()
 
-		err := w.writeOut()
+		start := time.Now()
+		err := w.writeOut(start)
+		elapsed := time.Since(start)
 
 		w.mu.Lock()
 		w.doneSeq = seq + 1 // batches completed, not last completed seq
 		if err != nil && w.err == nil {
 			w.err = err
+			w.failed.Store(true)
 		}
-		w.wakeLocked()
+		if w.fbatchDone != nil {
+			close(w.fbatchDone)
+			w.fbatchDone = nil
+		}
+		if err == nil {
+			w.adaptBurstLocked(n, elapsed)
+		}
 		// The sticky error may already be set by fail() while this flush
 		// succeeded — a session dying for an unrelated reason. Either way
 		// flushing stops, but only our own carrier error kills the session.
 		done := w.err != nil
 		if done {
-			w.flushing = false
+			w.flushing.Store(false)
 		}
 		w.mu.Unlock()
 
@@ -506,26 +1044,22 @@ func (w *writer) flushLoop() {
 	}
 }
 
-// wakeLocked releases everyone parked on the current batch generation. With
-// no waiters there is nobody to wake and the channel is left untouched, which
-// keeps the common single-writer path allocation-free.
-func (w *writer) wakeLocked() {
-	if w.waiters == 0 {
-		return
-	}
-	close(w.flushed)
-	w.flushed = make(chan struct{})
-}
-
 // writeOut issues the swapped-out batch. Control bytes lead the iovec, so a
 // window update is never delayed behind queued bulk data.
-func (w *writer) writeOut() error {
+func (w *writer) writeOut(now time.Time) error {
 	w.iov = w.iov[:0]
 	if len(w.fctl) > 0 {
 		w.iov = append(w.iov, w.fctl)
 	}
 	if len(w.fprio) > 0 {
 		w.iov = append(w.iov, w.fprio)
+	}
+	// Shards go ahead of the main data lane: a stream may follow a shard
+	// frame with a main-lane one in the same batch, never the reverse.
+	for i := range w.shards {
+		if w.fshards&(1<<i) != 0 {
+			w.iov = append(w.iov, w.shards[i].fbuf)
+		}
 	}
 	for _, c := range w.fchunks {
 		if c.ref != nil {
@@ -540,7 +1074,7 @@ func (w *writer) writeOut() error {
 	w.s.stats.recordFlush(w.fframes, w.fpayload)
 
 	if w.s.cfg.WriteTimeout > 0 {
-		_ = w.s.conn.SetWriteDeadline(time.Now().Add(w.s.cfg.WriteTimeout))
+		_ = w.s.conn.SetWriteDeadline(now.Add(w.s.cfg.WriteTimeout))
 		defer func() { _ = w.s.conn.SetWriteDeadline(time.Time{}) }()
 	}
 
@@ -607,7 +1141,7 @@ func (w *writer) drain(ctx context.Context) error {
 			w.mu.Unlock()
 			return err
 		}
-		if w.pending == 0 && !w.flushing {
+		if w.pending == 0 && w.shardBytes.Load() == 0 && !w.flushing.Load() {
 			w.mu.Unlock()
 			return nil
 		}
@@ -629,13 +1163,15 @@ func (w *writer) drain(ctx context.Context) error {
 	}
 }
 
-// fail releases every parked writer when the session dies for a reason the
-// writer did not observe itself (carrier read error, local Close).
+// fail latches the error when the session dies for a reason the writer did
+// not observe itself (carrier read error, local Close). Parked writers are
+// released by the session's done channel, which every one of them selects on
+// and which is closed before this is called.
 func (w *writer) fail(err error) {
 	w.mu.Lock()
 	if w.err == nil {
 		w.err = err
 	}
-	w.wakeLocked()
+	w.failed.Store(true)
 	w.mu.Unlock()
 }

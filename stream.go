@@ -33,8 +33,28 @@ type NativeStream struct {
 	// accepting frames, enforcing per-stream fairness. Guarded by the
 	// writer mutex. batchSeq is the batch sequence plus one, so the zero
 	// value means "not in any batch".
-	batchSeq   uint64
+	//
+	// batchSeq is written under that mutex but read without it by the
+	// writer's small-frame fast path, which must stay off any batch this
+	// stream already has frames in the main lanes of.
+	batchSeq   atomic.Uint64
 	batchBytes int
+
+	// announced mirrors synSent for the fast path: set once the SYN frame
+	// has been staged (or at creation for a stream the peer opened), after
+	// which a small frame no longer needs the writer mutex to decide SYN.
+	announced atomic.Bool
+
+	// shard is the staging shard this stream's small frames go to. Fixed
+	// for the stream's life, which is what keeps them in order.
+	shard uint32
+
+	// Admission-queue state, guarded by the writer mutex. admitCh carries
+	// the wake and is created the first time this stream has to wait;
+	// admitNeed is the size of the frame it is waiting to stage.
+	admitCh     chan struct{}
+	admitNeed   int
+	admitQueued bool
 
 	// priority routes this stream's DATA frames into the batch's priority
 	// lane, which the flusher places ahead of all bulk data. It is atomic
@@ -52,6 +72,7 @@ type NativeStream struct {
 	// Receive side.
 	rq         []segment // queued segments, oldest first
 	drain      []segment // scratch for draining rq without allocating
+	vec        [][]byte  // scratch for handing drained segments to a stream
 	recvd      uint64    // cumulative bytes arrived
 	consumed   uint64    // cumulative bytes delivered to the application
 	recvLimit  uint64    // absolute limit we have advertised
@@ -84,6 +105,7 @@ type NativeStream struct {
 	// wdSet reports whether a write deadline is currently armed, read on
 	// the send hot path to choose the copy path over zero copy.
 	wdSet atomic.Bool
+	rdSet atomic.Bool
 
 	// lastActive is the UnixNano of the most recent payload in either
 	// direction, for the optional idle sweep. Atomic so the sweep never
@@ -101,6 +123,23 @@ type NativeStream struct {
 // rather than referenced, so a deadline stays enforceable after admission.
 func (s *NativeStream) hasWriteDeadline() bool { return s.wdSet.Load() }
 
+// readDeadline and writeDeadline return the channel closed when the deadline
+// expires, or nil when none is armed. Most streams never set one, and the
+// flag spares every Read and Write the deadline's mutex in that case.
+func (s *NativeStream) readDeadline() chan struct{} {
+	if !s.rdSet.Load() {
+		return nil
+	}
+	return s.rd.wait()
+}
+
+func (s *NativeStream) writeDeadline() chan struct{} {
+	if !s.wdSet.Load() {
+		return nil
+	}
+	return s.wd.wait()
+}
+
 // segment is one received payload held in a pooled buffer. buf is the whole
 // pooled allocation and is what must be returned to the pool; data is the
 // unread remainder. Exactly one owner releases a segment, on every exit path
@@ -112,6 +151,37 @@ type segment struct {
 }
 
 func (sg segment) release() { pool.Put(sg.buf) }
+
+// coalesceMax is the largest payload that is copied into the spare room of
+// the previous segment's buffer rather than queued in a buffer of its own.
+//
+// A pooled buffer is a whole size class however little of it a frame uses,
+// while flow control counts only the payload. Queued one buffer per frame, a
+// stream of one-byte frames pins a kilobyte per byte of window — measured at
+// 194MB of heap for 200KB of unread payload, inside the default window and
+// available to any peer on every stream it may open. Packing small payloads
+// together bounds what a window can pin to a small multiple of the window.
+// Above this size the frame already fills a useful share of its class and
+// the extra copy would cost more than the memory it saves.
+const coalesceMax = 4 << 10
+
+// appendLocked adds p to the tail segment's buffer if it is small and fits,
+// reporting whether it did. Only segments still in rq are extended, and only
+// under s.mu, so no reader holds the buffer while it grows.
+func (s *NativeStream) appendLocked(p []byte) bool {
+	if len(p) > coalesceMax || len(s.rq) == 0 {
+		return false
+	}
+	tail := &s.rq[len(s.rq)-1]
+	if !tail.buf.Append(p) {
+		return false
+	}
+	// Re-slice from the grown buffer: the old data slice is capped at the
+	// buffer's previous length and cannot simply be extended.
+	b := tail.buf.Bytes()
+	tail.data = b[len(b)-len(tail.data)-len(p):]
+	return true
+}
 
 func releaseAll(segs []segment) {
 	for _, sg := range segs {
@@ -130,9 +200,21 @@ func newStream(sess *NativeSession, id uint32, local bool) *NativeStream {
 		sendLimit: sess.peerInitialWindow.Load(),
 		readable:  make(chan struct{}, 1),
 		writable:  make(chan struct{}, 1),
+		// IDs of one parity are consecutive even or odd numbers; drop the
+		// parity bit so they spread over every shard.
+		shard: (id >> 1) & sess.w.shardMask,
 	}
-	st.lastActive.Store(time.Now().UnixNano())
+	st.touch()
 	return st
+}
+
+// touch records activity for the idle sweep. The sweep is off by default, and
+// then nothing reads the timestamp, so the clock read is skipped: it sits on
+// the per-frame path in both directions.
+func (s *NativeStream) touch() {
+	if s.sess.cfg.StreamIdleTimeout > 0 {
+		s.lastActive.Store(time.Now().UnixNano())
+	}
 }
 
 // StreamID returns the wire stream ID (uint64 so QUIC's 62-bit IDs fit the
@@ -155,7 +237,7 @@ func (s *NativeStream) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	for {
-		if isClosedChan(s.rd.wait()) {
+		if isClosedChan(s.readDeadline()) {
 			return 0, os.ErrDeadlineExceeded
 		}
 		s.mu.Lock()
@@ -200,7 +282,7 @@ func (s *NativeStream) Read(p []byte) (int, error) {
 
 		select {
 		case <-s.readable:
-		case <-s.rd.wait():
+		case <-s.readDeadline():
 			return 0, os.ErrDeadlineExceeded
 		}
 	}
@@ -283,14 +365,33 @@ func (s *NativeStream) WriteTo(dst io.Writer) (int64, error) {
 			s.sess.sendWindowUpdate(s, limit)
 		}
 
-		for i, sg := range s.drain {
-			written, err := dst.Write(sg.data)
-			total += int64(written)
-			sg.release()
+		if ns, ok := dst.(*NativeStream); ok && len(s.drain) > 1 {
+			// Stream to stream, the relay case: hand over everything
+			// drained at once so the destination can batch the frames
+			// instead of flushing each. The segments stay ours until it
+			// returns, which is after the batches carrying them resolve.
+			s.vec = s.vec[:0]
+			for _, sg := range s.drain {
+				s.vec = append(s.vec, sg.data)
+			}
+			written, err := ns.writeBuffers(s.vec)
+			total += written
+			clear(s.vec)
+			releaseAll(s.drain)
 			if err != nil {
-				releaseAll(s.drain[i+1:])
 				clear(s.drain)
 				return total, err
+			}
+		} else {
+			for i, sg := range s.drain {
+				written, err := dst.Write(sg.data)
+				total += int64(written)
+				sg.release()
+				if err != nil {
+					releaseAll(s.drain[i+1:])
+					clear(s.drain)
+					return total, err
+				}
 			}
 		}
 		if len(s.drain) > 0 {
@@ -315,7 +416,7 @@ func (s *NativeStream) WriteTo(dst io.Writer) (int64, error) {
 
 		select {
 		case <-s.readable:
-		case <-s.rd.wait():
+		case <-s.readDeadline():
 			return total, os.ErrDeadlineExceeded
 		}
 	}
@@ -354,25 +455,54 @@ func (s *NativeStream) ReadFrom(src io.Reader) (int64, error) {
 func (s *NativeStream) Write(p []byte) (int, error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
-	total := 0
+	n, _, err := s.writeLocked(p, nil)
+	return int(n), err
+}
+
+// writeBuffers writes each buffer in order, as Write would, but lets
+// consecutive buffers that are each one frame or less share a batch. It is
+// what a relay uses: received segments arrive one frame at a time, and
+// writing them one Write at a time costs the destination a flush per frame
+// however many are waiting.
+func (s *NativeStream) writeBuffers(bufs [][]byte) (int64, error) {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	var total int64
+	for i := 0; i < len(bufs); {
+		n, used, err := s.writeLocked(bufs[i], bufs[i+1:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		i += 1 + used
+	}
+	return total, nil
+}
+
+// writeLocked writes all of p, and along with p's final frame as many of the
+// buffers in rest, whole and in order, as credit and the batch allow. It
+// returns the bytes written and how many of rest they included. The caller
+// holds wmu.
+func (s *NativeStream) writeLocked(p []byte, rest [][]byte) (total int64, used int, err error) {
 	for len(p) > 0 {
 		// An expired deadline fails the write even when the send path
 		// could satisfy it immediately. net.Conn requires a deadline
 		// already in the past to be honored — checking only where the
 		// write would block lets a call slip through whenever the batch
 		// happens to be empty, which is exactly when it is least expected.
-		if isClosedChan(s.wd.wait()) {
-			return total, os.ErrDeadlineExceeded
+		wd := s.writeDeadline()
+		if isClosedChan(wd) {
+			return total, used, os.ErrDeadlineExceeded
 		}
 		s.mu.Lock()
 		for {
 			if err := s.writeErr; err != nil {
 				s.mu.Unlock()
-				return total, err
+				return total, used, err
 			}
 			if s.finSent {
 				s.mu.Unlock()
-				return total, ErrStreamClosed
+				return total, used, ErrStreamClosed
 			}
 			if s.sendLimit > s.sent {
 				break
@@ -380,41 +510,77 @@ func (s *NativeStream) Write(p []byte) (int, error) {
 			s.mu.Unlock()
 			select {
 			case <-s.writable:
-			case <-s.wd.wait():
-				return total, os.ErrDeadlineExceeded
+			case <-wd:
+				return total, used, os.ErrDeadlineExceeded
 			}
+			wd = s.writeDeadline()
 			s.mu.Lock()
 		}
+		credit := s.sendLimit - s.sent
 		n := len(p)
-		if credit := s.sendLimit - s.sent; uint64(n) > credit {
+		if uint64(n) > credit {
 			n = int(credit)
 		}
-		if maxf := int(s.sess.peerMaxFrame.Load()); n > maxf {
-			n = maxf
+		// Offer the writer as much as it could stage in one batch, so a
+		// write spanning several frames can share a flush with itself. It
+		// takes at least one frame and reports how much.
+		maxf := int(s.sess.peerMaxFrame.Load())
+		hint := max(maxf, int(s.sess.w.takeHint.Load()))
+		if n > maxf {
+			n = min(n, hint)
 		}
-		s.sent += uint64(n)
+		// Buffers that follow are offered too, once this one's last frame
+		// is the one being sent: whole, and only as far as credit and the
+		// batch reach.
+		var more [][]byte
+		reserve := n
+		if n == len(p) && n <= maxf {
+			k := 0
+			for _, b := range rest[used:] {
+				if len(b) == 0 || len(b) > maxf || reserve+len(b) > hint || uint64(reserve+len(b)) > credit {
+					break
+				}
+				reserve += len(b)
+				k++
+			}
+			more = rest[used : used+k]
+		}
+		s.sent += uint64(reserve)
 		s.mu.Unlock()
-		s.lastActive.Store(time.Now().UnixNano())
+		s.touch()
 
 		// A stream with an active write deadline takes the copy path: the
 		// deadline could not be honored once the caller's buffer is
 		// pinned in an iovec that the kernel is reading.
-		if err := s.sess.writeData(s, p[:n], 0, s.hasWriteDeadline(), s.wd.wait()); err != nil {
-			// Give the credit back. These bytes were reserved above but
-			// never reached the wire — admission can fail on a write
-			// deadline while the stream stays perfectly usable, and
-			// keeping the reservation would shrink the window by n on
-			// every such expiry until the stream could never send again.
+		took, err := s.sess.w.appendData(s, p[:n], 0, s.hasWriteDeadline(), wd, more, false)
+		if took < reserve {
+			// Give back credit for what was not taken. On an error that is
+			// all of it: the bytes were reserved above but never reached
+			// the wire — admission can fail on a write deadline while the
+			// stream stays perfectly usable, and keeping the reservation
+			// would shrink the window by n on every such expiry until the
+			// stream could never send again.
 			s.mu.Lock()
-			s.sent -= uint64(n)
+			s.sent -= uint64(reserve - took)
 			s.mu.Unlock()
-			notify(s.writable)
-			return total, err
 		}
-		total += n
+		if err != nil {
+			notify(s.writable)
+			return total, used, err
+		}
+		total += int64(took)
+		if took < n {
+			p = p[took:]
+			continue
+		}
+		// All of p's remainder went, and whatever else was taken is whole
+		// buffers from the front of more.
 		p = p[n:]
+		for took -= n; took > 0; used++ {
+			took -= len(rest[used])
+		}
 	}
-	return total, nil
+	return total, used, nil
 }
 
 // SetPriority marks this stream latency-sensitive. Its DATA frames are then
@@ -431,6 +597,13 @@ func (s *NativeStream) SetPriority(on bool) {
 // CloseWrite half-closes: FIN rides an empty DATA frame (with SYN if this
 // stream never sent). The read side stays open.
 func (s *NativeStream) CloseWrite() error {
+	return s.closeWrite(false)
+}
+
+// closeWrite is CloseWrite with the option of leaving the FIN staged rather
+// than flushed. A caller that holds it must follow with something that
+// flushes; see Close.
+func (s *NativeStream) closeWrite(hold bool) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	s.mu.Lock()
@@ -456,7 +629,7 @@ func (s *NativeStream) CloseWrite() error {
 	// stranded streams in proportion to how often deadlines expired. A FIN
 	// is a few bytes on the copy path; the session write timeout still
 	// bounds it.
-	err := s.sess.writeData(s, nil, frame.FlagFIN, true, nil)
+	_, err := s.sess.w.appendData(s, nil, frame.FlagFIN, true, nil, nil, hold)
 	s.sess.maybeRemove(s)
 	return err
 }
@@ -513,13 +686,19 @@ func (s *NativeStream) CancelRead(code uint64) {
 
 // Close closes both directions: CloseWrite plus, if the peer has not already
 // finished sending, CancelRead — mirroring quic-go's stream close.
+//
+// The FIN is staged and left for the STOP_SENDING that usually follows to
+// flush, so closing a stream whose peer is still sending is one carrier
+// write rather than two. When no STOP_SENDING is due the kick at the end
+// flushes it.
 func (s *NativeStream) Close() error {
-	err := s.CloseWrite()
+	err := s.closeWrite(true)
 	s.CancelRead(CodeCanceled)
 	s.mu.Lock()
 	s.appClosed = true
 	s.mu.Unlock()
 	s.sess.maybeRemove(s)
+	s.sess.w.kick()
 	return err
 }
 
@@ -551,12 +730,14 @@ func (s *NativeStream) RemoteAddr() net.Addr { return s.sess.conn.RemoteAddr() }
 
 func (s *NativeStream) SetDeadline(t time.Time) error {
 	s.rd.set(t)
+	s.rdSet.Store(!t.IsZero())
 	s.setWriteDeadline(t)
 	return nil
 }
 
 func (s *NativeStream) SetReadDeadline(t time.Time) error {
 	s.rd.set(t)
+	s.rdSet.Store(!t.IsZero())
 	return nil
 }
 
