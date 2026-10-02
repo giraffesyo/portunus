@@ -94,8 +94,9 @@ func shardCount() uint32 {
 }
 
 type writer struct {
-	s   *NativeSession
-	tcp *net.TCPConn // non-nil when net.Buffers becomes a real writev
+	s       *NativeSession
+	tcp     *net.TCPConn // non-nil when net.Buffers becomes a real writev
+	batched *batchedConn // non-nil when the carrier sits on a Batched wrapper
 
 	mu sync.Mutex
 
@@ -220,6 +221,7 @@ func newWriter(s *NativeSession) *writer {
 	if tcp, ok := s.conn.(*net.TCPConn); ok {
 		w.tcp = tcp
 	}
+	w.batched = batchedUnder(s.conn)
 	// One frame until the first flush has measured the carrier.
 	w.takeHint.Store(int64(frame.FloorMaxFrameSize))
 	return w
@@ -1111,15 +1113,32 @@ func (w *writer) writeOut(now time.Time) error {
 	for _, b := range w.iov {
 		w.coalesce = append(w.coalesce, b...)
 	}
-	buf := w.coalesce
-	for len(buf) > 0 {
-		n := min(len(buf), tlsRecordSize)
-		if _, err := w.s.conn.Write(buf[:n]); err != nil {
-			return err
+	//
+	// Each record is still its own write on the transport beneath TLS unless
+	// that transport is a Batched wrapper, which holds them for the length
+	// of the batch and writes them out together.
+	if w.batched != nil {
+		// Idempotent and a single atomic load once complete. See hold for
+		// why the handshake must not be left to happen inside a held write.
+		if h, ok := w.s.conn.(handshaker); ok {
+			if err := h.Handshake(); err != nil {
+				return err
+			}
 		}
+		w.batched.hold()
+	}
+	var err error
+	for buf := w.coalesce; len(buf) > 0 && err == nil; {
+		n := min(len(buf), tlsRecordSize)
+		_, err = w.s.conn.Write(buf[:n])
 		buf = buf[n:]
 	}
-	return nil
+	if w.batched != nil {
+		if rerr := w.batched.release(); err == nil {
+			err = rerr
+		}
+	}
+	return err
 }
 
 // drain blocks until everything staged has reached the carrier.

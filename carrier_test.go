@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -93,6 +94,141 @@ func TestConformanceOverTLS(t *testing.T) {
 		cc, sc := tlsPair(t)
 		return startPair(t, cc, sc)
 	})
+}
+
+// countingConn counts the writes that reach the transport.
+type countingConn struct {
+	net.Conn
+	writes atomic.Int64
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	c.writes.Add(1)
+	return c.Conn.Write(p)
+}
+
+// batchedTLSPair returns TLS connections over Batched transports, with the
+// handshake deliberately not run: the session has to complete it before it
+// holds its first batch, and a pair that arrived already handshaken would not
+// show whether it does.
+func batchedTLSPair(t *testing.T) (client, server net.Conn, clientWrites *atomic.Int64) {
+	t.Helper()
+	serverCfg, clientCfg := testTLSConfigs(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	accepted := make(chan res, 1)
+	go func() {
+		c, err := ln.Accept()
+		accepted <- res{c, err}
+	}()
+	rawClient, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := <-accepted
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	counted := &countingConn{Conn: rawClient}
+	cc := tls.Client(portunus.Batched(counted), clientCfg)
+	sc := tls.Server(portunus.Batched(r.c), serverCfg)
+	t.Cleanup(func() { cc.Close(); sc.Close() })
+	return cc, sc, &counted.writes
+}
+
+// TestConformanceOverBatchedTLS runs the shared suite with the transport
+// beneath TLS wrapped by Batched, and with the handshake left for the session
+// to drive.
+func TestConformanceOverBatchedTLS(t *testing.T) {
+	conformance.Run(t, func(t *testing.T) (portunus.Session, portunus.Session) {
+		cc, sc, _ := batchedTLSPair(t)
+		// Both constructors write SETTINGS, and so drive a handshake that
+		// needs the other side: start them together.
+		type res struct {
+			s   *portunus.NativeSession
+			err error
+		}
+		srv := make(chan res, 1)
+		go func() {
+			s, err := portunus.Server(sc, nil)
+			srv <- res{s, err}
+		}()
+		client, err := portunus.Client(cc, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := <-srv
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		t.Cleanup(func() { client.Close(); r.s.Close() })
+		return client, r.s
+	})
+}
+
+// A batch over a Batched transport must reach the socket in about one write,
+// not one per TLS record. Unwrapped, a 64KB frame is five.
+func TestBatchedTLSWritesOncePerBatch(t *testing.T) {
+	cc, sc, writes := batchedTLSPair(t)
+	type res struct {
+		s   *portunus.NativeSession
+		err error
+	}
+	srv := make(chan res, 1)
+	go func() {
+		s, err := portunus.Server(sc, nil)
+		srv <- res{s, err}
+	}()
+	client, err := portunus.Client(cc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := <-srv
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	server := r.s
+	defer client.Close()
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() {
+		st, err := server.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, st)
+	}()
+	st, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64<<10)
+	// Past the handshake and crypto/tls's small-record ramp before counting.
+	for range 50 {
+		if _, err := st.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w0, f0 := writes.Load(), client.Stats().Flushes
+	for range 200 {
+		if _, err := st.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w, f := writes.Load()-w0, client.Stats().Flushes-f0
+	// One per flush, plus slack for the control frames flushed alongside.
+	if float64(w) > 1.5*float64(f) {
+		t.Fatalf("%d socket writes for %d flushes of one 64KB frame each; want about one per flush", w, f)
+	}
 }
 
 // TestConformanceOverUnix covers a stream carrier that is neither TCP nor

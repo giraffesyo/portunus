@@ -54,8 +54,9 @@ type Config struct {
 	// message queued behind bulk writers waits for the whole kernel buffer
 	// to drain, so tail latency reflects kernel bufferbloat rather than our
 	// own queue — the one queue our batching and fairness caps cannot
-	// reach. Zero selects 128KB on TCP carriers; negative leaves the
-	// kernel default. Ignored where the option does not exist.
+	// reach. Zero selects 128KB on TCP carriers, TLS over TCP included;
+	// negative leaves the kernel default. Ignored where the option does not
+	// exist.
 	NotSentLowat int
 
 	// CongestionControl selects the carrier's TCP congestion-control

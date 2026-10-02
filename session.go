@@ -115,17 +115,20 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*NativeSession, error)
 
 	// Group commit does Nagle's job in userspace; the kernel's version
 	// would only serialize our writes against delayed ACKs.
-	if tcp, ok := conn.(*net.TCPConn); ok {
+	//
+	// The socket is looked for beneath TLS as well: a TLS carrier is still
+	// one TCP flow, and the options below matter to it exactly as much.
+	if tcp := tcpUnder(conn); tcp != nil {
 		_ = tcp.SetNoDelay(true)
-	}
-	if c.NotSentLowat > 0 {
-		// Best effort: an unsupported kernel just keeps deeper queues.
-		_ = applyNotSentLowat(conn, c.NotSentLowat)
-	}
-	if c.CongestionControl != "" {
-		// Best effort: an algorithm the kernel does not offer is left at
-		// the system default.
-		_ = applyCongestionControl(conn, c.CongestionControl)
+		if c.NotSentLowat > 0 {
+			// Best effort: an unsupported kernel just keeps deeper queues.
+			_ = applyNotSentLowat(tcp, c.NotSentLowat)
+		}
+		if c.CongestionControl != "" {
+			// Best effort: an algorithm the kernel does not offer is left
+			// at the system default.
+			_ = applyCongestionControl(tcp, c.CongestionControl)
+		}
 	}
 
 	// The reader starts before the handshake is written. Nothing requires
