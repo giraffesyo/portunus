@@ -5,10 +5,22 @@ on:
     branches: [main, canary]
   pull_request:
 
+# Nothing here writes to the repository, so the token cannot either. A job
+# that needs more must ask for it by name.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded pull-request runs are noise; branch pushes each run to the end
+  # so every commit on canary has a verdict.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   core:
     name: Core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -18,8 +30,10 @@ jobs:
         # it builds; only running the suite proves it works.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.x'
 
@@ -51,9 +65,12 @@ jobs:
   quic-adapter:
     name: QUIC adapter
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.x'
       - name: Conformance suite over QUIC
@@ -63,12 +80,15 @@ jobs:
   quic-latest:
     name: QUIC adapter vs quic-go@latest
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # quic-go is pre-1.0 and breaks its API every few releases; this catches
     # that within a day instead of at the next integration.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.x'
       - name: Build and test against the newest quic-go
@@ -80,9 +100,12 @@ jobs:
   fuzz:
     name: Protocol fuzzing
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.x'
 
@@ -114,9 +137,12 @@ jobs:
   leak-profile:
     name: Goroutine leak profile
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.x'
       - name: Soak and leak detection
@@ -129,9 +155,12 @@ jobs:
   bench:
     name: Benchmarks vs yamux
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.x'
       - name: Smoke-run the comparison suite
@@ -141,9 +170,12 @@ jobs:
   netem:
     name: WAN profile (netem-shaped)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.x'
 
