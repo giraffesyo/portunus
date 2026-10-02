@@ -177,9 +177,18 @@ Invariants (each one's absence is a deadlock or a stranded batch):
   error, if any); then take the pending batch, designate an awake
   successor, or — on session death — fail all pending waiters.
   Flush-in-flight is never false while a non-empty batch has no flusher.
-- Batch-completion wakeup is a broadcast (intrusive waiter list or
-  generation-counted cond), never a per-batch channel — that would be an
-  allocation per batch.
+- Wakeups are targeted, not broadcast. A zero-copy writer waits on its own
+  batch's channel, created only when a writer is parked on a batch someone
+  else will flush, so the uncontended path still allocates nothing. Writers
+  held at admission wait in a FIFO queue and are woken when the batch is
+  **swapped out** — the moment room appears — and only as many as the new
+  batch holds. The earlier broadcast at flush completion was wrong twice
+  over: the room had been free for the whole writev with the waiters still
+  asleep, so the flusher's next swap took a nearly empty batch, and every
+  waiter woke to contend for room a few could use (2.6 frames per flush and
+  3.6 parks per frame with 64 bulk writers; 5.7 and 1.0 after). A woken
+  writer that leaves without staging passes its wake on, since nothing else
+  would trigger the next one.
 
 Fairness and bounds:
 
@@ -194,6 +203,23 @@ Fairness and bounds:
   waiting stream joins the ring **at the tail**: Go's h2 scheduler starved
   long-lived streams for years precisely because newly-writable streams
   enqueued ahead of existing ones (go#58804).
+- **The bulk share of a batch is sized in time, not bytes.** The byte cap
+  exists to bound flush duration, and what a byte costs in time is the
+  carrier's business: 448KB is a third of a millisecond on 10GbE and
+  eighteen on a 200mbit path. Bulk is therefore admitted against a limit
+  that doubles while flushes complete in under half a millisecond and halves
+  when one takes over two, between one frame and the configured cap. On a
+  fast carrier batches fill; on a slow one a batch carries a single bulk
+  frame, and a small write arriving mid-flush waits for one frame to leave
+  rather than several. Small writes and control frames are not subject to
+  it.
+- **A write spanning several frames stages them together**, up to the
+  stream's share of that limit, instead of flushing each before looking at
+  the next. With other streams' data in the batch or waiting, the share is
+  the configured per-stream cap; with the batch to itself, the whole limit.
+  This is the frame-size lever (syscalls per byte) without asking the peer
+  to accept larger frames, and without the cost that kept the frame size at
+  64KB.
 - `net.Buffers` issues at most 1024 iovecs per writev and loops beyond
   that. Flat staging keeps small-frame iovec counts low, but a flush is not
   assumed to be exactly one syscall.
@@ -227,14 +253,42 @@ Carrier realities:
   per batch: chunk the coalesce at 16KB so no memcpy exceeds what a record
   carries, and document `DynamicRecordSizingDisabled: true` for bulk-TLS
   users. Zero-copy does not exist on TLS at all — crypto/tls copies and
-  encrypts into its own record buffer regardless.
+  encrypts into its own record buffer regardless. The per-record write can
+  only be fixed from beneath the `tls.Conn`: `Batched` wraps the transport
+  before TLS is layered on it, and the session holds each batch's records
+  there and writes them out together (64KB frame: five socket writes down
+  to one). The session completes the handshake before it first holds, since
+  a held handshake flight would wait forever for its own reply.
+- Socket options (`TCP_NODELAY`, `TCP_NOTSENT_LOWAT`, congestion control)
+  are applied to the TCP connection beneath TLS as well, found through
+  `tls.Conn.NetConn`. They used to be skipped for anything that was not
+  itself a `*net.TCPConn`, which silently excluded the most common carrier.
 
-Contention plan (many-core), **measured**: the knee is at four cores, after
-which throughput degrades about 20% and plateaus rather than collapsing —
-batching rises as contention does, and larger batches pay for the lock. A
-mutex profile attributes 84% of contention here, to `appendData`. The
-mitigations below remain unimplemented because a 20% plateau does not yet
-justify them; see bench/BASELINE.md for the curve.
+Contention (many-core), **measured, then fixed**: the knee was at four cores,
+after which throughput degraded about 20% and plateaued, and a mutex profile
+put 84% of contention in `appendData`. That was left alone while a 20%
+plateau was the whole cost. Once the per-frame overheads around it were
+gone it was the whole profile — half of all CPU on the many-stream
+small-message path — and the first of the mitigations sketched below went
+in: small DATA frames are staged in per-stream-hashed shards, each under its
+own lock, and the flusher gathers them when it swaps the batch. Three things
+keep it correct, each with a test that fails without it:
+
+- *Stream order.* Shards are written after control and priority and before
+  the main data lane, and a stream always uses the same shard. A small frame
+  stays off its shard while the stream has main-lane frames in the pending
+  batch, and the flusher empties the shards before it publishes the next
+  batch number — in the other order a frame could slip into a shard not yet
+  gathered and overtake the data it follows.
+- *No stranded bytes.* A shard frame has no flusher of its own. The writer
+  publishes its bytes and then checks for a flusher; an exiting flusher
+  clears its flag and then checks for bytes. One of them sees the other.
+- *The idle path is untouched.* With no flush in flight the writer would
+  become the flusher anyway, so it takes the locked path, which stages and
+  claims in one acquisition. Shards are for when there is a flusher to feed.
+
+The scaling curve now has no knee: flat from four cores up, at under 40% of
+the old per-message cost. See bench/BASELINE.md.
 
 The batch mutex is a global serialization point by construction. Mutex/block profiles are first-class benchmark
 outputs, and the suite includes a GOMAXPROCS scaling curve (1→2→8→32) to
@@ -273,6 +327,9 @@ benchmark, not assumed.
 
 - `Stream.Read` copies out of segments (the `io.Reader` contract requires it)
   and returns exhausted segments to the pool.
+- When the destination of `WriteTo` is itself a stream, everything drained
+  is handed to it in one call, so the destination can stage the frames as a
+  batch instead of flushing one per segment.
 - `Stream.WriteTo` hands segments directly to the destination writer, so
   `io.Copy(dst, stream)` skips the intermediate copy. If `dst` is another mux
   stream, segments ride straight into its writev batch: the proxy/relay path

@@ -670,3 +670,162 @@ Under one percent does not buy that risk.
 
 Churn is already 2.8x faster than yamux with a third of the allocations. The
 work is not deferred any longer; it is declined, with a number attached.
+
+## Syscalls per byte, wakeups per frame, and clock reads per frame
+
+A review pass that started from profiles rather than from ideas. On loopback
+the bulk paths are 75-85% raw syscalls, as before, so the only lever there is
+still syscalls per byte. The small-message path was different: 10% of its CPU
+was `time.Now`, 12% the slow path of a mutex unlock, and 27% the scheduler.
+Each change below came from a count that was wrong, and the counts are what
+to trust here. Timings are loopback TCP, six interleaved passes, `benchstat`
+medians, on two machines: linux/amd64 (Go 1.26, 8 cores, otherwise idle) and
+darwin/arm64 (Go 1.27, 18 cores, not idle).
+
+| Benchmark | linux before | linux after | | darwin before | darwin after | |
+|---|---|---|---|---|---|---|
+| Bulk, 1MB writes | 8.9 GB/s | 14.2 GB/s | +60% | 10.7 GB/s | 14.5 GB/s | +36% |
+| Small msgs, 64 streams | 282 ns/op | 124 ns/op | -56% | 306 ns/op | 162 ns/op | -47% |
+| Bulk, 64KB writes | 8.9 GB/s | 8.8 GB/s | none | 10.8 GB/s | 11.0 GB/s | none |
+| Relay | 6.5 GB/s | 7.1 GB/s | none | 6.9 GB/s | 7.3 GB/s | none |
+| Echo RTT 64B | 11.1 µs | 10.8 µs | none | 24.2 µs | 23.6 µs | -3% |
+| Stream open/close | 9.3 µs | 9.5 µs | none | 7.7 µs | 7.8 µs | none |
+| Mixed: RTT under 4 bulk streams | 100 µs | 102 µs | none | 1.14 ms | 1.12 ms | none |
+| Bulk over TLS, 64KB writes | 2.4 GB/s | 3.4 GB/s with `Batched` | +40% | 2.6 GB/s | 4.0 GB/s with `Batched` | +52% |
+
+Every difference given as a percentage is significant at p<0.01; "none" means
+the ranges overlap. Stream open/close allocates 60 bytes more per cycle, the
+admission-queue fields on each stream; the time did not measurably move.
+
+**A lone stream never batched with itself.** A 1MB write measured exactly 1.00
+frames per flush: each frame was staged, flushed inline and waited for before
+the next was looked at. Staging a write's frames together reaches 5.2 per
+flush. This is the gain the frame-size sweep at the top of this file found
+(64KB to 256KB frames, 10.6 to 13.6 GB/s) taken without raising the frame
+size, and the reason the frame size stayed at 64KB still applies to it: a long
+writev is latency for whoever arrives during it. So the burst is sized from
+how long flushes take: the bulk share of a batch doubles while flushes finish
+in under half a millisecond and halves when one takes over two, down to a
+single frame. Writes of one frame or less are unaffected, and so is the relay
+path, which hands over one received segment at a time.
+
+**Admission woke everyone, late.** With 64 bulk writers a batch that holds six
+frames went out with 2.6, at 3.6 parks per frame. Waiters were woken when a
+flush completed, but the room they were waiting for appeared when the batch
+was swapped out, a whole writev earlier; by the time they ran, the flusher had
+already taken the next batch. Waking a batch's worth, in arrival order, at the
+swap: 5.7 frames per flush and 1.0 parks per frame.
+
+**Four clock reads per frame.** Liveness is now judged by whether the frame
+counter moved between keepalive ticks; the idle-sweep timestamps are taken
+only when the sweep is enabled, which it is not by default; and the BDP probe
+decision is ruled out by one atomic load before it reads the clock or takes
+the estimator lock. Plain data on a live stream also no longer takes the
+stream lock a second time to ask whether the stream is finished.
+
+**One buffer per frame was a memory amplifier.** A pooled buffer is a whole
+size class while flow control counts payload: 200KB sent as one-byte frames to
+a stream nobody was reading pinned 194MB, inside the default window. Payloads
+up to 4KB are now copied into the previous segment's spare room, which bounds
+what a window can pin to a small multiple of the window and, as a side effect,
+releases the frame's own buffer on the goroutine that took it.
+
+**TLS pays per record.** `crypto/tls` writes one record per syscall, so a 64KB
+frame was 4.98 socket writes. `Batched`, wrapped around the transport before
+TLS, holds a batch's records and writes them together. It did nothing for the
+many-stream small-message row (188 against 184 ns/op), where the batch is
+already dozens of records and encryption dominates.
+
+### The same changes on a shaped path
+
+Loopback cannot show what any of this costs a slow link, so the two-machine
+harness was run with both ends on one host over a netem-shaped loopback:
+27ms each way, 200mbit, kernel default congestion control BBR. Baseline and
+new builds interleaved, four reps, medians with ranges. The new column
+includes the next section's changes.
+
+| 54ms, 200mbit, BBR | baseline | new |
+|---|---|---|
+| 256MB, one stream | 22.2 MB/s | 22.2 |
+| 8 streams, 8MB each | 21.2 MB/s (21.1-21.5) | 21.6 (21.3-21.7) |
+| 4MB, one stream | 6.5 MB/s | 6.5 |
+| 64B round trip, idle | 54.1 ms | 54.1 ms |
+| request p50, 1 bulk stream | 205 ms (142-205) | 210 ms (205-231) |
+| request p50, 4 bulk streams | 224 ms (210-247) | 241 ms (236-244) |
+
+Throughput is the link's on both builds and the idle round trip is
+identical. Batches on this path average 1.2 frames per flush either way: the
+time-sized bulk limit keeps a slow link at one bulk frame per flush. The
+request rows overlap; the four-stream median is 7% higher, the same direction
+and about the size of the mixed row on loopback in the next section, where
+echoed bulk now moves as a relay batch.
+
+The two things left undone here, the writer mutex and the relay path, are
+the next section.
+
+## The writer mutex, the relay path, and Close
+
+A second pass over the same ground, started from a profile of the build
+above. On the many-stream small-message path that profile was one thing: half
+of all CPU in `appendData`, nearly all of it taking and handing off the
+writer mutex. The contention the scaling section of this file measured and
+declined to fix was now the only cost left on that path.
+
+linux/amd64, 8 cores, loopback TCP, six interleaved passes against the same
+committed baseline as the section above, `benchstat` medians, every row
+significant at p<0.01 unless marked.
+
+| Benchmark | baseline | previous section | now | vs baseline |
+|---|---|---|---|---|
+| Small msgs, 64 streams | 275 ns/op | 124 ns/op | 89 ns/op | -68% |
+| Stream open/close | 9.2 µs | 9.5 µs | 5.6 µs | -39% |
+| Relay | 7.6 GB/s | 7.1 GB/s (no change) | 8.9 GB/s | +16% |
+| Bulk, 1MB writes | 9.1 GB/s | 14.2 GB/s | 15.3 GB/s | +68% |
+| Bulk, 64KB writes | 8.9 GB/s | 8.8 GB/s | 9.2 GB/s | none |
+| Echo RTT 64B | 10.7 µs | 10.8 µs | 10.6 µs | none |
+| Mixed: RTT under 4 echoed bulk streams | 95 µs @ 5742 MB/s | 94 µs @ 5779 MB/s | 104 µs @ 7944 MB/s | +9% latency, +38% bulk |
+
+The scaling sweep, one writer per core, 256-byte messages:
+
+| GOMAXPROCS | baseline | now |
+|---|---|---|
+| 1 | 2162 ns/op | 1964 |
+| 2 | 384 | 150 |
+| 4 | 270 | 101 |
+| 8 | 290 | 108 |
+| 16 | 300 | 114 |
+
+**Small frames no longer take the writer mutex.** They are copied into one of
+up to sixteen shards, chosen by stream, each under its own lock; the flusher
+gathers the shards when it swaps the batch. DESIGN.md has the three
+invariants. The first version of this moved the benchmark only 14%, and
+counting why was worth more than the change itself: half of all small writes
+were still on the locked path. One fallback — a full shard, a moment with no
+flusher — staged the frame in the main lane, which commits the stream to the
+locked path for the rest of that batch so its frames stay in order; and under
+contention the wait for the mutex outlasts a batch, so the next write
+arrived to find itself committed again. A frame that reaches the locked path
+now still goes to its shard when it can, and the stream is only held to the
+main lane by data that is actually there.
+
+The idle path does not use shards. An earlier cut that did made the unloaded
+echo round trip measurably slower, for locks that bought nothing: with no
+flush in flight the writer is about to become the flusher.
+
+**Relay finally gets batching.** `WriteTo` handed the destination one
+received segment per `Write`, so the multi-frame staging in the section
+above never reached the proxy path. Stream to stream, it now hands over
+everything drained at once. The mixed row is the same change seen from the
+other side: its bulk streams are echoed, which is a relay, so the session
+carries 38% more bulk and the small request beside it pays 9% for the
+company. That is the trade this file insists on reading on both axes.
+
+**Close is one carrier write, not two.** Closing a stream whose peer is
+still sending emits FIN and STOP_SENDING; they were flushed separately. The
+FIN is now staged and leaves with the STOP_SENDING. An open-write-close
+cycle goes from three client writes to two, and the peer's side shortens
+with it. Each stream is 130 bytes larger than at baseline (1351 against 1221
+bytes allocated per cycle) for the queue, shard and deadline fields added
+across both sections.
+
+**Reads and writes skip the deadline lock when no deadline is set.**
