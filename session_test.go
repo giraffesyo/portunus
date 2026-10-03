@@ -600,6 +600,7 @@ func TestConfigValidation(t *testing.T) {
 		{MaxIncomingStreams: -1}, // nonsense
 		{AcceptBacklog: -1},      // nonsense
 		{MaxFrameSize: 1 << 25},  // above 24-bit wire cap
+		{MaxBatchBytes: 2 << 30}, // past the batch's 32-bit offsets
 	} {
 		if _, err := Client(conn, cfg); err == nil {
 			t.Errorf("accepted invalid config %+v", cfg)
@@ -679,7 +680,7 @@ func TestSmallFramesShareReceiveBuffers(t *testing.T) {
 	for {
 		n, err := ss.Read(buf)
 		got = append(got, buf[:n]...)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

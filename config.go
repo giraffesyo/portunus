@@ -183,6 +183,9 @@ const (
 	defaultRecvBudget     = 128 << 20
 	defaultKeepalive      = 20 * time.Second
 	defaultNotSentLowat   = 128 << 10
+
+	// maxBatchBytes is the largest MaxBatchBytes accepted; see buildConfig.
+	maxBatchBytes = 1 << 30
 )
 
 func buildConfig(in *Config) (Config, error) {
@@ -256,6 +259,12 @@ func buildConfig(in *Config) (Config, error) {
 	}
 	if c.AcceptBacklog < 1 {
 		return c, fmt.Errorf("portunus: AcceptBacklog %d < 1", c.AcceptBacklog)
+	}
+	// The batch's staging offsets are 32-bit. A batch near the bound is
+	// already seconds of flush on any real link, so this only ever rejects
+	// a mistake.
+	if c.MaxBatchBytes > maxBatchBytes {
+		return c, fmt.Errorf("portunus: MaxBatchBytes %d above %d", c.MaxBatchBytes, maxBatchBytes)
 	}
 	// A batch must be able to hold at least one maximum-size frame, or a
 	// full-size write could never be admitted.
