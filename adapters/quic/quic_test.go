@@ -111,15 +111,15 @@ func testTLS(t *testing.T) (server, client *tls.Config) {
 	pool.AddCert(leaf)
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"mux-conformance"},
-		MinVersion:   tls.VersionTLS13,
-	}, &tls.Config{
-		RootCAs:    pool,
-		ServerName: "127.0.0.1",
-		NextProtos: []string{"mux-conformance"},
-		MinVersion: tls.VersionTLS13,
-	}
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"mux-conformance"},
+			MinVersion:   tls.VersionTLS13,
+		}, &tls.Config{
+			RootCAs:    pool,
+			ServerName: "127.0.0.1",
+			NextProtos: []string{"mux-conformance"},
+			MinVersion: tls.VersionTLS13,
+		}
 }
 
 // Shutdown must wait for the streams the application still holds rather than

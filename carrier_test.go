@@ -357,13 +357,13 @@ func testTLSConfigs(t *testing.T) (server, client *tls.Config) {
 	pool.AddCert(leaf)
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}, &tls.Config{
-		RootCAs:    pool,
-		ServerName: "127.0.0.1",
-		MinVersion: tls.VersionTLS13,
-	}
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS13,
+		}, &tls.Config{
+			RootCAs:    pool,
+			ServerName: "127.0.0.1",
+			MinVersion: tls.VersionTLS13,
+		}
 }
 
 // echoAndCompare sends payload through an echo on the peer and checks every
