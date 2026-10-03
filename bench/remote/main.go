@@ -75,6 +75,12 @@ type preamble struct {
 	// its echo of the same stream; prioritizing only the client's send would
 	// fix one leg of the round trip and leave the reply queued behind bulk.
 	Priority bool `json:"prio,omitempty"`
+	// CC names the TCP congestion-control algorithm both ends set on the
+	// raw socket before any multiplexer speaks, for every implementation
+	// alike, so a comparison under BBR or CUBIC is a comparison of the
+	// libraries and not of whichever controller each host defaults to.
+	// Linux only; elsewhere, and when empty, the system default stands.
+	CC string `json:"cc,omitempty"`
 }
 
 // prioritizer is the optional priority control a portunus stream exposes and
@@ -112,6 +118,7 @@ func main() {
 		nsl       = flag.Int("not-sent", 0, "portunus NotSentLowat; 0 = default, negative disables")
 		rbg       = flag.Int("recv-budget", 0, "portunus MaxReceiveBudget; 0 = default")
 		prio      = flag.Bool("priority", false, "portunus: mark the rr/rrload request stream priority")
+		cc        = flag.String("cc", "", "TCP congestion control for both ends, all impls (Linux): bbr, cubic, reno")
 	)
 	flag.Parse()
 
@@ -141,7 +148,7 @@ func main() {
 			Streams: *streams, Size: *size, YamuxWindow: *ywin,
 			InitWindow: *iw, MaxWindow: *mw, RecvBuf: *rb, MaxFrame: *mf,
 			MaxBatch: *mb, NotSent: *nsl, RecvBudget: *rbg,
-			Priority: *prio,
+			Priority: *prio, CC: *cc,
 		}
 		res, err := runClient(*addr, p, *bytesFlag, *count)
 		if err != nil {
@@ -472,6 +479,9 @@ func handle(c net.Conn, verbose bool) error {
 	if err := json.Unmarshal(trimNul(buf), &p); err != nil {
 		return fmt.Errorf("bad preamble: %w", err)
 	}
+	if err := setCongestion(c, p.CC); err != nil {
+		return fmt.Errorf("congestion control %q: %w", p.CC, err)
+	}
 
 	sess, err := serveSession(c, p)
 	if err != nil {
@@ -688,6 +698,9 @@ func dial(addr string, p preamble) (session, error) {
 	}
 	if len(enc) > preambleSize {
 		return nil, fmt.Errorf("preamble of %d bytes exceeds %d", len(enc), preambleSize)
+	}
+	if err := setCongestion(c, p.CC); err != nil {
+		return nil, fmt.Errorf("congestion control %q: %w", p.CC, err)
 	}
 	buf := make([]byte, preambleSize)
 	copy(buf, enc)

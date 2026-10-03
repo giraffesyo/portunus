@@ -167,6 +167,57 @@ jobs:
         working-directory: bench
         run: go test -bench=. -benchtime=10x -run XXX ./...
 
+  bench-regression:
+    name: Benchmark regression gate
+    # A comparison only means something on one machine, so it runs where
+    # there is a base to compare against: a pull request's target.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: head
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: head/bench/go.sum
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+      - name: Compare base and head, interleaved on this runner
+        # The script comes from head, so a pull request that changes the gate
+        # is judged by the gate it proposes; it is a regression check, not a
+        # security boundary.
+        run: head/bench/regress.sh base head
+
+  race-stress:
+    name: Race stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+      - name: Concurrency-sensitive tests, repeated
+        # Several send-path bugs only ever showed under repetition with
+        # other tests competing for the cores: an ordering slip at a batch
+        # swap, a lost admission wake, a shutdown reset. One pass of the
+        # suite runs each of these once; this runs them enough to catch a
+        # one-in-a-few-hundred interleaving.
+        run: >-
+          go test -race -count=25
+          -run 'Admission|MultiFrame|SmallFrameShard|MixedLane|NeverStranded|WriteBuffers|Close|Relay|Shutdown|Priority'
+          .
+
   netem:
     name: WAN profile (netem-shaped)
     runs-on: ubuntu-latest
