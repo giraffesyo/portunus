@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
 
       - name: Verify the core has no dependencies
         if: runner.os != 'Windows'
@@ -62,6 +62,22 @@ jobs:
         if: runner.os != 'Windows'
         run: go test ./internal/frame -fuzz=FuzzParseHeader -fuzztime=30s
 
+  min-go:
+    name: Minimum Go (1.26)
+    # Everything else runs on the current Go. go.mod promises the library
+    # builds and passes on the version it names, and a promise nothing runs
+    # is one a new standard-library call can break without anyone noticing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+      - run: go test -count=1 ./...
+
   quic-adapter:
     name: QUIC adapter
     runs-on: ubuntu-latest
@@ -72,7 +88,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
       - name: Conformance suite over QUIC
         working-directory: adapters/quic
         run: go test -race -count=1 ./...
@@ -90,7 +106,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
       - name: Build and test against the newest quic-go
         working-directory: adapters/quic
         run: |
@@ -107,7 +123,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
 
       - name: Wire format
         run: go test -run XXX -fuzz=FuzzParseHeader -fuzztime=60s ./internal/frame
@@ -144,7 +160,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
       - name: Soak and leak detection
         # The runtime's own detector proves a goroutine is permanently
         # blocked, which counting stacks by hand cannot.
@@ -162,7 +178,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
       - name: Smoke-run the comparison suite
         working-directory: bench
         run: go test -bench=. -benchtime=10x -run XXX ./...
@@ -186,7 +202,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           cache-dependency-path: ${{ matrix.module }}/go.sum
       # Tools run by exact version through the module proxy, so they are
       # pinned and checksum-verified like any other dependency.
@@ -207,7 +223,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           cache: false
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
@@ -233,7 +249,7 @@ jobs:
           path: base
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           cache-dependency-path: head/bench/go.sum
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@latest
@@ -253,7 +269,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
       - name: Concurrency-sensitive tests, repeated
         # Several send-path bugs only ever showed under repetition with
         # other tests competing for the cores: an ordering slip at a batch
@@ -275,7 +291,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
 
       - name: Shape loopback (200ms RTT, 100mbit)
         # The in-process delay harness has no bandwidth limit, so its numbers
