@@ -163,9 +163,9 @@ jobs:
           go-version: '1.27.x'
       - name: Soak and leak detection
         # The runtime's own detector proves a goroutine is permanently
-        # blocked, which counting stacks by hand cannot.
-        env:
-          GOEXPERIMENT: goroutineleakprofile
+        # blocked, which counting stacks by hand cannot. It is built in from
+        # Go 1.27; on 1.26 it was GOEXPERIMENT=goroutineleakprofile, which
+        # 1.27 rejects as unknown.
         run: go test -count=1 -run 'TestSoak|TestGoroutineLeakProfile|TestNoGoroutineLeak' ./...
 
   bench:

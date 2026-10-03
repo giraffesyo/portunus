@@ -19,11 +19,12 @@ import (
 // blocked — exactly the shape the flusher exit protocol and credit accounting
 // produce when they go wrong.
 //
-// It requires GOEXPERIMENT=goroutineleakprofile; CI runs it that way.
+// The profile is built in from Go 1.27. On 1.26 it needs
+// GOEXPERIMENT=goroutineleakprofile, and without it the test skips.
 func TestGoroutineLeakProfile(t *testing.T) {
 	p := pprof.Lookup("goroutineleak")
 	if p == nil {
-		t.Skip("run with GOEXPERIMENT=goroutineleakprofile to enable")
+		t.Skip("needs Go 1.27, or GOEXPERIMENT=goroutineleakprofile on 1.26")
 	}
 
 	before := p.Count()
