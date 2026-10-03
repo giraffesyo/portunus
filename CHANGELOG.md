@@ -3,15 +3,6 @@
 ## 0.1.0 (2026-10-03)
 
 
-### ⚠ BREAKING CHANGES
-
-* the import path is now github.com/giraffesyo/portunus and the package identifier is portunus. Any existing import of github.com/giraffesyo/mux must be updated.
-
-### refactor
-
-* rename module to portunus ([2057218](https://github.com/giraffesyo/portunus/commit/2057218dfa1e16168227bcdad1e4e62fc3a65a33))
-
-
 ### Features
 
 * add abuse limits, panic containment, and Stats() ([cbf3eb4](https://github.com/giraffesyo/portunus/commit/cbf3eb4bf4218f257c988074059da59c5fa372ff))
