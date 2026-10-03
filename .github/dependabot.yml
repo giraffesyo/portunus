@@ -1,4 +1,6 @@
 version: 2
+# Every update waits a week after release before Dependabot proposes it, so
+# a compromised version has time to be caught and yanked before it is here.
 updates:
   # Actions are pinned to commit SHAs in the workflows; this keeps the pins
   # moving instead of rotting.
@@ -6,6 +8,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
 
   # The core module has no dependencies by construction (CI enforces it), so
   # only the two satellite modules need watching.
@@ -15,3 +19,5 @@ updates:
       - /bench
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7

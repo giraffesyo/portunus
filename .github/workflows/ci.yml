@@ -167,6 +167,53 @@ jobs:
         working-directory: bench
         run: go test -bench=. -benchtime=10x -run XXX ./...
 
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Three modules: the dependency-free core and the two satellites
+        # that keep their dependencies out of it.
+        module: [., bench, adapters/quic]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      # Tools run by exact version through the module proxy, so they are
+      # pinned and checksum-verified like any other dependency.
+      - name: golangci-lint (linters and gofmt)
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run ./...
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -test ./...
+
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: zizmor (workflow security audit)
+        run: pipx run zizmor==1.30.1 --offline .
+
   bench-regression:
     name: Benchmark regression gate
     # A comparison only means something on one machine, so it runs where

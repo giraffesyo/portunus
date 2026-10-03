@@ -1,0 +1,32 @@
+name: Release
+
+# release-please keeps a release pull request open against canary, updating
+# CHANGELOG.md and the next version from conventional commit messages.
+# Merging that pull request tags the release and publishes it on GitHub; the
+# Go module proxy picks the tag up from there. Nothing is built or uploaded:
+# this is a library, so the tag is the release.
+
+on:
+  push:
+    branches: [canary]
+
+permissions: {}
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR and tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the tag and the GitHub release
+      pull-requests: write # open and update the release pull request
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: canary
