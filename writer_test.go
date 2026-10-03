@@ -209,29 +209,30 @@ func TestBurstAdaptsToFlushDuration(t *testing.T) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.burst = 1
+	quiet := time.Now() // the zero smallAt is long past
 
 	// Fast flushes that exercised the current size double it, up to what a
 	// batch can hold.
 	for range 10 {
-		w.adaptBurstLocked(w.burst*maxf, burstFast/2)
+		w.adaptBurstLocked(w.burst*maxf, burstFast/2, quiet)
 	}
 	if w.burst != limit {
 		t.Fatalf("burst %d after fast flushes, want the batch limit %d", w.burst, limit)
 	}
 	// A fast flush too small to have tested the burst proves nothing.
 	w.burst = 4
-	w.adaptBurstLocked(100, burstFast/2)
+	w.adaptBurstLocked(100, burstFast/2, quiet)
 	if w.burst != 4 {
 		t.Fatalf("burst %d after a small fast flush, want 4", w.burst)
 	}
 	// In between, it holds.
-	w.adaptBurstLocked(4*maxf, (burstFast+burstSlow)/2)
+	w.adaptBurstLocked(4*maxf, (burstFast+burstSlow)/2, quiet)
 	if w.burst != 4 {
 		t.Fatalf("burst %d after a middling flush, want 4", w.burst)
 	}
 	// A slow carrier halves it, down to one bulk frame per flush.
 	for range 5 {
-		w.adaptBurstLocked(maxf, 2*burstSlow)
+		w.adaptBurstLocked(maxf, 2*burstSlow, quiet)
 	}
 	if w.burst != 1 {
 		t.Fatalf("burst %d after slow flushes, want 1", w.burst)
@@ -697,5 +698,40 @@ func TestCloseFlushesFinWhenNothingFollows(t *testing.T) {
 	ss.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := ss.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("peer read %v after Close, want EOF: the FIN was never flushed", err)
+	}
+}
+
+// Small DATA frames mean someone is waiting behind bulk: one puts the bulk
+// batch back to a single frame, and it may not grow again until the session
+// has gone burstQuiet without one, however many flushes that spans.
+func TestBurstYieldsToSmallFrames(t *testing.T) {
+	client, _ := pair(t, nil)
+	settled(t, client)
+	w := client.w
+	maxf := int(client.peerMaxFrame.Load())
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.burst = 4
+	t0 := time.Now()
+
+	w.noteSmallLocked(true, t0)
+	if w.burst != 1 {
+		t.Fatalf("burst %d after a small frame, want 1", w.burst)
+	}
+	// A thousand fast flushes, all inside the quiet period.
+	for i := range 1000 {
+		now := t0.Add(time.Duration(i) * burstQuiet / 1000)
+		w.noteSmallLocked(false, now)
+		w.adaptBurstLocked(w.burst*maxf, burstFast/2, now)
+		if w.burst != 1 {
+			t.Fatalf("burst grew to %d %v after a small frame, want it held at 1 for %v", w.burst, now.Sub(t0), burstQuiet)
+		}
+	}
+	now := t0.Add(burstQuiet)
+	w.noteSmallLocked(false, now)
+	w.adaptBurstLocked(w.burst*maxf, burstFast/2, now)
+	if w.burst != 2 {
+		t.Fatalf("burst %d once the quiet period has passed, want it free to double to 2", w.burst)
 	}
 }

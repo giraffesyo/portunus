@@ -46,6 +46,15 @@ const (
 	// write can be held out of the batch currently being assembled.
 	smallWriteReserve = 64 << 10
 
+	// burstQuiet is how long the session must go without a small DATA frame
+	// before the bulk batch may grow past one frame. It is a time, not a
+	// count of flushes: on a fast link flushes take tens of microseconds, so
+	// any count short enough to matter elapses between two requests of an
+	// interactive stream, and the batch had regrown by the time the next
+	// request arrived. Interactive traffic that goes quiet for longer than
+	// this has nobody waiting behind bulk.
+	burstQuiet = 10 * time.Millisecond
+
 	// burstFast and burstSlow are the flush durations that grow and shrink
 	// the bulk batch. Between them it holds. A 64KB frame takes about 5ms to
 	// leave on a 100mbit link and 50µs on 10GbE, so links where a frame is
@@ -173,6 +182,12 @@ type writer struct {
 	// for Write to size its credit reservation without the lock.
 	burst    int
 	takeHint atomic.Int64
+
+	// sawSmall is set when a small DATA frame is staged, from any lane, and
+	// taken by the flusher at the swap; smallAt is when the last batch that
+	// had one was flushed. See noteSmallLocked.
+	sawSmall atomic.Bool
+	smallAt  time.Time
 
 	// flushing is written only under mu. It is atomic so the fast path can
 	// tell, without mu, that a flusher is running and will pick its bytes up.
@@ -438,6 +453,9 @@ func (w *writer) appendData(st *NativeStream, payload []byte, flags frame.Flags,
 		st.batchBytes = 0
 	}
 
+	if !syn && len(payload) > 0 && first < zeroCopyThreshold {
+		w.sawSmall.Store(true)
+	}
 	take, frames := first, 1
 	switch {
 	case syn:
@@ -632,6 +650,7 @@ func (w *writer) shardAppend(st *NativeStream, hdr *[frame.HeaderSize]byte, payl
 	}
 	sh.buf = append(sh.buf, hdr[:]...)
 	sh.buf = append(sh.buf, payload...)
+	w.sawSmall.Store(true)
 	sh.frames++
 	sh.payload += uint64(len(payload))
 	// Published inside the shard lock, where the flusher also takes it
@@ -878,15 +897,37 @@ func (w *writer) burstFramesLocked(st *NativeStream, n, maxf int) int {
 	return max(1, min(room/per, (n+maxf-1)/maxf))
 }
 
+// noteSmallLocked records whether the batch just flushed carried a small DATA
+// frame. One that did puts the bulk batch back to a single frame at once.
+//
+// Flush duration alone says how fast the carrier is, not whether anyone is
+// waiting on it. On a fast link every flush finishes well under burstFast, so
+// the batch grew to its cap with interactive traffic present, and a request
+// arriving mid-flush waited behind several bulk frames instead of one.
+// Measured between two hosts at about 50 Gbit/s, with four bulk streams
+// beside a request stream, that cost 10-20% on request p50 and p99 against
+// the previous release; holding bulk to one frame per flush turned it into a
+// 10% gain on both, at the same bulk throughput. Small frames are the signal
+// that someone is waiting: a bulk transfer is made of full frames, and
+// control frames do not count.
+func (w *writer) noteSmallLocked(small bool, now time.Time) {
+	if small {
+		w.smallAt = now
+		w.burst = 1
+	}
+}
+
 // adaptBurstLocked resizes the bulk batch after a flush of n bytes that took
 // d. A flush the carrier absorbed quickly doubles it, provided the flush was
-// large enough to have tested the current size; a slow one halves it. The
-// thresholds are in time rather than bytes because time is what a writer
-// arriving mid-flush pays.
-func (w *writer) adaptBurstLocked(n int, d time.Duration) {
+// large enough to have tested the current size and no small frame has been
+// seen recently; a slow one halves it. The thresholds are in time rather than
+// bytes because time is what a writer arriving mid-flush pays.
+func (w *writer) adaptBurstLocked(n int, d time.Duration, now time.Time) {
 	maxf := int(w.s.peerMaxFrame.Load())
 	per := maxf + frame.HeaderSize
 	switch {
+	case now.Sub(w.smallAt) < burstQuiet:
+		w.burst = 1
 	case d > burstSlow:
 		w.burst = max(1, w.burst/2)
 	case d <= burstFast && n >= w.burst*maxf/2:
@@ -986,6 +1027,7 @@ func (w *writer) flushLoop() {
 		// a shard that is still to be gathered, and so into this batch
 		// ahead of the main-lane data it follows.
 		n := w.gatherShardsLocked()
+		small := w.sawSmall.Swap(false)
 		seq := w.seq
 		w.seq++
 		w.seqA.Store(w.seq)
@@ -1024,7 +1066,8 @@ func (w *writer) flushLoop() {
 			w.fbatchDone = nil
 		}
 		if err == nil {
-			w.adaptBurstLocked(n, elapsed)
+			w.noteSmallLocked(small, start)
+			w.adaptBurstLocked(n, elapsed, start)
 		}
 		// The sticky error may already be set by fail() while this flush
 		// succeeded — a session dying for an unrelated reason. Either way
