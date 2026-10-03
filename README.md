@@ -96,6 +96,32 @@ Where UDP is blocked but you still want QUIC semantics, this library over a
 TLS carrier is the pragmatic answer — the stream API is deliberately the same
 shape, so the migration is a constructor change.
 
+## Tuning
+
+The defaults are chosen for a session that does a bit of everything on an
+unknown path, and they autotune. Change them for a reason, from this table;
+every row is a measured trade, with the numbers in
+[bench/BASELINE.md](bench/BASELINE.md).
+
+| Your traffic | Change | What it buys, and what it costs |
+|---|---|---|
+| Interactive requests sharing a session with bulk | `Stream.SetPriority(true)` on the request stream, on both ends | About 25% lower median latency at no throughput cost; the p99 tail does not move, because the queue it sits behind is in the kernel |
+| Interactive requests on a long path where tail latency matters more than bulk throughput | Lower `MaxWindow` toward 256KB | Median near the bare round trip, at roughly half the bulk throughput; the trade only exists below about 1MB |
+| Bulk and interactive on one connection, Linux, kernel offers BBR | `CongestionControl: "bbr"` | Keeps the bottleneck queue short without capping the window, the one setting that moves both axes at once |
+| A TLS carrier | Wrap the transport: `tls.Client(portunus.Batched(tcp), cfg)` | A batch becomes one socket write instead of one per 16KB record; about 40-50% more bulk throughput over TLS (experimental) |
+| Short transfers, single-digit megabytes, over a long path | Raise `InitialWindow` toward the path's bandwidth-delay product | Skips the ramp that autotuning spends its first round trips on; costs that much memory per stream from the start |
+| A fast link carrying mostly bulk | Raise `MaxFrameSize` to 128KB | Fewer frames per byte; every small message on the session can wait up to one frame's transmission time behind bulk |
+| A slow link carrying interactive traffic | Lower `MaxFrameSize` toward 16KB | Less time behind each bulk frame, at more framing per byte |
+| Thousands of mostly idle sessions on one host | Lower `ReadBufferSize` from 256KB | The buffer is per session and only pays off near line rate; the memory is held regardless |
+| A server facing untrusted peers | Set `StreamIdleTimeout`, and `MaxResetsPerSecond` if resets are not part of normal traffic | Reclaims slots a silent peer would otherwise hold forever |
+
+Leave `MaxBatchBytes`, `PerStreamBatchBytes` and `NotSentLowat` alone unless
+a profile says otherwise: batching sizes itself from how fast the carrier
+takes each flush, and none of the three moved anything measurable in the
+sweeps behind this table. `NativeSession.Stats` reports what the adaptive parts
+are actually doing — frames per flush, window stalls, measured RTT and
+window target — and is the place to start before changing anything.
+
 ## What's honest about it
 
 - **TCP head-of-line blocking is not solved.** One lost packet stalls every

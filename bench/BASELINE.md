@@ -829,3 +829,61 @@ bytes allocated per cycle) for the queue, shard and deadline fields added
 across both sections.
 
 **Reads and writes skip the deadline lock when no deadline is set.**
+
+## Two hosts, and what loopback had hidden
+
+Every number above this section came from loopback, with or without netem
+shaping. This one crosses a real network: two hosts in one cluster, 0.19ms
+apart, 9000-byte MTU, both ends pinned to 8 cores, six interleaved reps per
+row, medians with ranges.
+
+| | previous release | now | yamux, 8MB window | bare TCP |
+|---|---|---|---|---|
+| bulk, 1 stream | 53.2 Gbit/s | 52.5 | 26.0 | 40.5 |
+| bulk, 8 streams | 53.8 | 52.2 | 31.7 | 129 (8 connections) |
+| bulk, 64 streams | 50.4 | 49.6 | 29.7 | - |
+| 64B round trip p50 | 63.6 µs | 63.5 | 102 | - |
+| stream opens/s | 11.4k | 11.1k | 7.5k | - |
+
+**Bulk is flat, and the reason is not the send path.** Every stream count
+lands near 50 Gbit/s on both builds, where eight separate TCP connections
+reach 129. That is the one-connection, one-reader ceiling DESIGN.md
+documents, and the loopback bulk gains above cannot show past it. Moving
+it means scaling the receive side, not the writer.
+
+**The mixed workload had regressed, and loopback had called it a trade.**
+With four bulk streams beside a request stream, the build above was 10-20%
+worse on request p50 and p99 than the previous release, at the same bulk
+throughput. On loopback the same row had read as "+9% latency for +38%
+bulk"; here the bulk was equal, so there was no trade, only a cost.
+Switching suspects off one at a time found it: the bulk batch, sized from
+flush duration alone, grows to its cap on any fast link, interactive
+traffic or not, and a request arriving mid-flush waits behind several bulk
+frames. Shards were the opposite of a suspect — with them off, request
+p50 rose to 912µs.
+
+| request under 4 bulk streams | p50 | p99 |
+|---|---|---|
+| previous release | 682 µs | 1296 µs |
+| build above | 676 | 1152 |
+| bulk batch capped at one frame, by hand | 591 | 933 |
+| small frames reset the batch, 16-flush quiet period | 620 | 1117 |
+| small frames reset the batch, 10ms quiet period (now) | 571 | 941 |
+
+The fix now in place: any small DATA frame puts the bulk batch back to one
+frame, and it may grow again only after 10ms without one. The first cut
+counted quiet flushes instead and recovered little: on this link flushes
+take tens of microseconds, so sixteen of them pass between two requests.
+2ms recovered less than 10ms and 50ms no more. With a priority stream the
+gain is smaller, 681/1101 to 627/1026µs; with one bulk stream it is a tie,
+588/948 to 565/945; single-stream bulk is unchanged at 48 Gbit/s; and a
+bulk-only session still batches 5.2 frames per flush.
+
+**Shutdown lost frames to a reset, at baseline too.** The test that checks
+a graceful shutdown delivers everything failed a few times per thousand
+runs on Linux. Instrumented, it was never a lost frame: the peer refused
+streams because its own write had hit a broken pipe, because we had
+closed with its replies unread and the kernel sent RST, which also
+discards what the peer had not yet read. Shutdown now stops the writer,
+half-closes, and reads until the peer closes before closing its side. 0
+failures in 2880 runs, against 2-3 in 2880 at baseline.

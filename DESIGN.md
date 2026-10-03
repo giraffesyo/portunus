@@ -212,7 +212,10 @@ Fairness and bounds:
   fast carrier batches fill; on a slow one a batch carries a single bulk
   frame, and a small write arriving mid-flush waits for one frame to leave
   rather than several. Small writes and control frames are not subject to
-  it.
+  it. Speed alone is not enough, though: on a fast link every flush is
+  fast, so the batch also drops to one frame whenever a small DATA frame
+  is staged, and may grow again only after 10ms without one. Small frames
+  mean someone is waiting behind bulk; bulk is made of full frames.
 - **A write spanning several frames stages them together**, up to the
   stream's share of that limit, instead of flushing each before looking at
   the next. With other streams' data in the batch or waiting, the share is
@@ -232,6 +235,13 @@ Write deadlines and stalled peers:
   (Mid-writev the kernel is reading a zero-copy caller's memory; releasing
   that writer early would violate the buffer-reuse contract. Bulk paths
   that want zero-copy don't set deadlines.)
+- **Graceful shutdown half-closes and drains before closing.** A socket
+  closed with received data unread sends RST, and the peer then discards
+  what it had not read — including the frames the shutdown just drained to
+  it. So Shutdown stops the writer (nothing may be written after the
+  half-close; a broken pipe there would be session-fatal and close the
+  socket early, unread data and all), half-closes, and reads until the
+  peer closes its side, bounded at two seconds.
 - A **session-level carrier write timeout** bounds every flush (deadline
   set on the carrier per flush). Expiry is session-fatal — correct for a
   mux, since a partially written batch has already desynced the wire. This
