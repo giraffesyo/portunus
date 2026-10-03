@@ -887,3 +887,25 @@ closed with its replies unread and the kernel sent RST, which also
 discards what the peer had not yet read. Shutdown now stops the writer,
 half-closes, and reads until the peer closes before closing its side. 0
 failures in 2880 runs, against 2-3 in 2880 at baseline.
+
+## Against yamux, for the v0.1.0 README
+
+The README's headline numbers, measured on the code tagged v0.1.0.
+linux/amd64, 8 cores, loopback TCP, both libraries at a 16MB window, six
+interleaved passes, `benchstat` medians; every row significant at p=0.002.
+
+| Benchmark | yamux | portunus | |
+|---|---|---|---|
+| Small msgs, 64 streams | 4829 ns/op | 91 ns/op | 53× |
+| Relay | 3.2 GB/s | 8.7 GB/s | 2.7× |
+| Stream open/close | 15.5 µs | 5.7 µs | 2.7× |
+| Bulk, 64KB writes | 5.7 GB/s | 9.0 GB/s | 1.6× |
+| Bulk, 1MB writes | 7.8 GB/s | 14.9 GB/s | 1.9× |
+| Echo RTT 64B | 14.8 µs | 10.6 µs | 1.4× |
+| Open-loop p50 / p99 | 126 / 4492 µs | 92 / 244 µs | 1.4× / 18× |
+| Mixed: RTT under 4 bulk streams | 100 µs @ 2893 MB/s | 68 µs @ 4908 MB/s | 1.5× lower at 1.7× the bulk |
+| Allocations per op, bulk / small / relay | 2 / 2 / 6 | 0 / 0 / 0 | |
+
+Between two hosts, from the "Two hosts" section above: bulk 52 against 26
+Gbit/s, 64-byte round trip 63.5 against 102 µs, request p50 under four bulk
+streams about 570 against 3107 µs, stream opens 11.1k against 7.5k per second.

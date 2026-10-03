@@ -7,18 +7,25 @@ satisfying `net.Conn`).
 The wire protocol is specified in [SPEC.md](SPEC.md); both ends of a
 connection must implement it.
 
-**Status: feature-complete, not yet released.** Everything through the
-hardening pass is built and tested; the version has not been tagged and the
-API may still move. See [DESIGN.md](DESIGN.md) for the architecture and
+**Status: pre-1.0.** Releases are tagged `v0.x`; until 1.0 the API may
+still move, and `Stream.SetPriority` and `Batched` are marked experimental.
+See [DESIGN.md](DESIGN.md) for the architecture and
 [bench/BASELINE.md](bench/BASELINE.md) for measured numbers, including what
 does not yet win.
 
-Against tuned yamux on loopback TCP: **20× on many-stream small messages**
-(at zero allocations per operation), **2.3× on relay** (the proxy workload),
-**2.8× on stream churn**, **1.6× on single-stream bulk**, and a **1.5×
-better p99** under open-loop load. On a high-RTT path, autotuning reaches
-2.8× yamux's shipped configuration but still trails a hand-tuned static
-window — an open problem documented in the baseline.
+Against yamux, both tuned to the same 16MB window, on loopback TCP
+(linux/amd64, 8 cores): **53× on many-stream small messages** (at zero
+allocations per operation), **2.7× on relay** (the proxy workload), **2.7×
+on stream churn**, **1.6-1.9× on single-stream bulk**, and an **18× lower
+p99** under open-loop load. With four bulk streams beside a request stream,
+requests see 1.5× lower latency while the session carries 1.7× the bulk.
+
+Between two hosts on a real network: **2× the bulk throughput** (52 against
+26 Gbit/s), a **1.6× faster** idle round trip, and about **5× lower request
+latency under bulk load**. On a 55ms internet path, window autotuning
+reaches what a hand-tuned window would — 19 MB/s against 19 for yamux at
+8MB and 3.6 for yamux as shipped — without the hand; on transfers of a few
+megabytes it still trails a pre-sized window while it ramps.
 
 Peer input is rate-limited against the known multiplexer DoS shapes (ping
 floods, empty-frame floods, reset churn), and a panic in a library goroutine
