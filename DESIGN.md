@@ -42,7 +42,14 @@ design diff), with all surviving amendments folded in.
   carrier. QUIC's genuine advantage; no userspace mux fixes it.
 - A session's receive side is one goroutine, bounded by a single core's
   parse + memcpy throughput (tens of Gb/s). Scale past it with multiple
-  sessions; the splice relay path bypasses userspace entirely.
+  sessions; the splice relay path bypasses userspace entirely. Measured
+  between two hosts on a 9000-byte-MTU network, one session tops out near
+  50 Gbit/s whether it carries 1, 8 or 64 streams, where eight separate
+  TCP connections reach 129 (bench/BASELINE.md, "Two hosts"). The split
+  between this ceiling and the next one is inferred, not measured: a
+  single bare TCP connection managed 40 Gbit/s in the same run, so one
+  flow is not obviously the limit, but the reader was not profiled
+  during it. Profiling it is the first step toward moving the ceiling.
 - One carrier means one TCP flow's congestion window. Striping is a v2
   candidate (see SETTINGS reserved bits).
 - Autotuning sizes the window for throughput, and on a session that also

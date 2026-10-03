@@ -128,7 +128,8 @@ window target — and is the place to start before changing anything.
   stream on the carrier. That is physics, and it is QUIC's genuine advantage;
   no userspace mux fixes it. The QUIC adapter exists for when you need that.
 - **A session's receive side is one goroutine**, so it is bounded by one
-  core's parse-and-copy throughput. Run multiple sessions to scale past it.
+  core's parse-and-copy throughput — measured near 50 Gbit/s between two
+  hosts, at any stream count. Run multiple sessions to scale past it.
 - **The wire format is clean-slate**, so both ends must run this library. It
   is not yamux-compatible and never will be.
 - Prefer HTTP/2 or WebSocket when an on-path L7 proxy has to parse your
