@@ -65,8 +65,9 @@ func serveEcho(c context.Context, s portunus.Session) {
 			return
 		}
 		go func(st portunus.Stream) {
-			io.Copy(st, st)
-			st.CloseWrite()
+			// An echo whose peer went away has nothing to report to.
+			_, _ = io.Copy(st, st)
+			_ = st.CloseWrite()
 		}(st)
 	}
 }
@@ -140,8 +141,9 @@ func testBulk(t *testing.T, newPair Pair) {
 		t.Fatal(err)
 	}
 	go func() {
-		st.Write(payload)
-		st.CloseWrite()
+		// A failed write shows up as a short read below.
+		_, _ = st.Write(payload)
+		_ = st.CloseWrite()
 	}()
 	got, err := io.ReadAll(st)
 	if err != nil {
@@ -280,8 +282,9 @@ func testConcurrentStreams(t *testing.T, newPair Pair) {
 			}
 			want := bytes.Repeat([]byte{byte(i)}, 4<<10)
 			go func() {
-				st.Write(want)
-				st.CloseWrite()
+				// A failed write shows up as a short read below.
+				_, _ = st.Write(want)
+				_ = st.CloseWrite()
 			}()
 			got, err := io.ReadAll(st)
 			if err != nil {
@@ -316,7 +319,7 @@ func testStreamIDs(t *testing.T, newPair Pair) {
 			t.Fatalf("stream ID %d issued twice", id)
 		}
 		seen[id] = true
-		st.Close()
+		_ = st.Close()
 	}
 }
 
@@ -371,5 +374,5 @@ func testNetConn(t *testing.T, newPair Pair) {
 	if string(buf) != "net.Conn" {
 		t.Fatalf("got %q", buf)
 	}
-	conn.Close()
+	_ = conn.Close()
 }

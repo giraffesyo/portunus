@@ -65,8 +65,7 @@ type NativeSession struct {
 	closed   bool
 	closeErr error
 
-	accept   chan *NativeStream
-	acceptMu sync.Mutex // serializes AcceptStream callers' backlog draining
+	accept chan *NativeStream
 
 	done      chan struct{} // closed once the session is dead
 	closeOnce sync.Once

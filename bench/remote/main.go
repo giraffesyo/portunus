@@ -27,6 +27,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -136,9 +137,8 @@ func main() {
 		if *pprofAddr != "" {
 			go func() { log.Println(http.ListenAndServe(*pprofAddr, nil)) }()
 		}
-		if err := runServer(*listen, *verbose); err != nil {
-			log.Fatal(err)
-		}
+		// runServer returns only on failure.
+		log.Fatal(runServer(*listen, *verbose))
 	case "client":
 		if *addr == "" {
 			log.Fatal("client mode needs -addr")
@@ -454,7 +454,7 @@ func runServer(addr string, verbose bool) error {
 			return err
 		}
 		go func() {
-			if err := handle(c, verbose); err != nil && err != io.EOF {
+			if err := handle(c, verbose); err != nil && !errors.Is(err, io.EOF) {
 				log.Printf("connection from %s: %v", c.RemoteAddr(), err)
 			}
 		}()
@@ -576,7 +576,7 @@ func serveEcho(ctx context.Context, sess session, priority bool) error {
 			// already handed out, so the echo it is running must be allowed
 			// to finish rather than being closed out from under itself.
 			wg.Wait()
-			return nil
+			return nil //nolint:nilerr // the end of accepting is the end of the run, not a failure
 		}
 		wg.Add(1)
 		go func() {

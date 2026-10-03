@@ -2,6 +2,7 @@ package portunus
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -351,7 +352,7 @@ func TestAdmissionWakeIsPassedOn(t *testing.T) {
 	quitter.sendAborted.Store(true)
 	release()
 
-	if err := <-quit; err != ErrStreamClosed {
+	if err := <-quit; !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("abandoned writer returned %v, want ErrStreamClosed", err)
 	}
 	select {
@@ -689,14 +690,14 @@ func TestCloseFlushesFinWhenNothingFollows(t *testing.T) {
 	if err := ss.(*NativeStream).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Read(make([]byte, 1)); err != io.EOF {
+	if _, err := st.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("read %v, want EOF from the peer's FIN", err)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
 	ss.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := ss.Read(make([]byte, 1)); err != io.EOF {
+	if _, err := ss.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("peer read %v after Close, want EOF: the FIN was never flushed", err)
 	}
 }

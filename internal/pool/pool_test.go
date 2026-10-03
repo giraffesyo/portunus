@@ -27,7 +27,7 @@ func TestBytesCapacityIsCapped(t *testing.T) {
 		t.Fatalf("capacity %d exceeds the %d valid bytes", cap(s), 100)
 	}
 	// Appending must therefore copy rather than extend into the pool.
-	grown := append(s, 'x')
+	grown := append(s, 'x') //nolint:gocritic // a new slice is the point: the test checks append copies
 	if &grown[0] == &s[0] {
 		t.Fatal("append extended into pooled memory instead of copying")
 	}
