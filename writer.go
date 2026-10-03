@@ -2,6 +2,7 @@ package portunus
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"runtime"
@@ -1177,6 +1178,42 @@ func (w *writer) drain(ctx context.Context) error {
 			return ctx.Err()
 		case <-w.s.done:
 			return w.s.closedErr()
+		case <-t.C:
+		}
+	}
+}
+
+// errWritesStopped is latched by stopWrites. Anything staged afterwards is
+// dropped rather than written.
+var errWritesStopped = errors.New("portunus: carrier writes stopped for shutdown")
+
+// stopWrites waits for any flush in flight to finish and then refuses all
+// further writes, so the carrier can be half-closed with nothing left to
+// write into it. It reports false if ctx ended first or the writer had
+// already failed.
+func (w *writer) stopWrites(ctx context.Context) bool {
+	t := time.NewTicker(time.Millisecond)
+	defer t.Stop()
+	for {
+		w.mu.Lock()
+		if w.err != nil {
+			w.mu.Unlock()
+			return false
+		}
+		// Latched under mu with no flush running, so none can start
+		// between this check and the latch.
+		if !w.flushing.Load() {
+			w.err = errWritesStopped
+			w.failed.Store(true)
+			w.mu.Unlock()
+			return true
+		}
+		w.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-w.s.done:
+			return false
 		case <-t.C:
 		}
 	}

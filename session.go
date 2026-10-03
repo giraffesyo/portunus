@@ -969,6 +969,7 @@ func (s *NativeSession) Shutdown(ctx context.Context) error {
 				_ = s.Close()
 				return ctx.Err()
 			}
+			s.lingerClose(ctx)
 			return s.Close()
 		}
 		select {
@@ -979,6 +980,56 @@ func (s *NativeSession) Shutdown(ctx context.Context) error {
 			return s.closedErr()
 		case <-tick.C:
 		}
+	}
+}
+
+// shutdownLinger bounds how long a graceful shutdown waits for the peer to
+// close its side after ours is half-closed. A peer running this library
+// closes as soon as it reads the end of our stream, one round trip; the
+// bound is for one that never does.
+const shutdownLinger = 2 * time.Second
+
+// lingerClose half-closes the carrier and waits for the peer to close its
+// side before the caller closes ours.
+//
+// Closing a TCP socket that still holds unread received data makes the
+// kernel send RST instead of FIN, and a peer that receives RST discards
+// whatever it had not yet read — including the final frames this shutdown
+// just drained to it. That race is easy to lose: the peer answers the
+// frames we send (a PING ACK, a STOP_SENDING for a stream we closed), and
+// any answer that lands after our last read but before the close turns the
+// close into a reset. TestShutdownFlushesQueuedFrames lost it a few times a
+// thousand on Linux under load, the peer accepting only some of the streams
+// that had already been written to it.
+//
+// Half-closing instead sends FIN and keeps reading: the reader drains
+// whatever the peer still sends, the peer's reader sees end of stream and
+// closes its side, and our reader then sees end of stream too. Only then is
+// there nothing unread to turn the close into a reset. Carriers that cannot
+// half-close (net.Pipe, most wrappers) are closed as before.
+func (s *NativeSession) lingerClose(ctx context.Context) {
+	cw, ok := s.conn.(interface{ CloseWrite() error })
+	if !ok {
+		return
+	}
+	// Nothing may be written once our side is half-closed: the reader keeps
+	// answering the peer (a PING ACK, a window update), and a write after
+	// the half-close fails with a broken pipe, which is session-fatal, which
+	// closes the carrier with the peer's data still unread — the very reset
+	// this exists to avoid. That chain was the residual failure the test
+	// still showed at a few per thousand after the half-close went in.
+	if !s.w.stopWrites(ctx) {
+		return
+	}
+	if err := cw.CloseWrite(); err != nil {
+		return
+	}
+	t := time.NewTimer(shutdownLinger)
+	defer t.Stop()
+	select {
+	case <-s.readDone:
+	case <-ctx.Done():
+	case <-t.C:
 	}
 }
 
