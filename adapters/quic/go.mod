@@ -1,6 +1,6 @@
 module github.com/giraffesyo/portunus/adapters/quic
 
-go 1.26.1
+go 1.27.2
 
 require (
 	github.com/giraffesyo/portunus v0.0.0
