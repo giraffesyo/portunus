@@ -240,6 +240,18 @@ func (b *bdpEstimator) target() uint64 {
 	return b.bdp
 }
 
+// pathBDP returns the best observed bandwidth times the min-filtered RTT,
+// or zero until both have been measured. It is diagnostic only: a cap based
+// on this value regressed throughput in the shaped-path sweeps.
+func (b *bdpEstimator) pathBDP() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.bwMax == 0 || b.minRTT == 0 {
+		return 0
+	}
+	return uint64(b.bwMax * b.minRTT.Seconds())
+}
+
 // budget bounds the total receive credit the session may have outstanding,
 // so autotuning cannot turn "many briefly-fast streams" into an OOM. It only
 // ever declines to grow a window — granted credit is never revoked — so it

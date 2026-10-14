@@ -1,0 +1,39 @@
+strace -f -qq -c -e trace=write,writev,read
+BenchmarkCarrierMux/<carrier>/64K, -benchtime=1000x -cpu=8.
+Counts include benchmark setup and control traffic; timings under tracing are not throughput measurements.
+
+candidate / unix
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 50.31    0.017933          17      1022           writev
+ 49.52    0.017653          47       374        21 read
+  0.17    0.000059           8         7           write
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.035645          25      1403        21 total
+
+
+candidate / wrapped TCP
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 60.02    0.023063          11      2035           write
+ 39.98    0.015362           7      2111       393 read
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.038425           9      4146       393 total
+
+
+control / unix
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 55.10    0.028675           5      5040           write
+ 44.90    0.023368           6      3804       443 read
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.052043           5      8844       443 total
+
+
+control / wrapped TCP
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 59.46    0.032312           6      5043           write
+ 40.54    0.022029           4      5106       976 read
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.054341           5     10149       976 total

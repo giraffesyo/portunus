@@ -134,9 +134,10 @@ window target — and is the place to start before changing anything.
 - **TCP head-of-line blocking is not solved.** One lost packet stalls every
   stream on the carrier. That is physics, and it is QUIC's genuine advantage;
   no userspace mux fixes it. The QUIC adapter exists for when you need that.
-- **A session's receive side is one goroutine**, so it is bounded by one
-  core's parse-and-copy throughput — measured near 50 Gbit/s between two
-  hosts, at any stream count. Run multiple sessions to scale past it.
+- **A session's receive side is one goroutine**, measured near 50 Gbit/s
+  between two hosts, at any stream count. A receive-side CPU profile puts
+  most of the cost in socket-read syscalls, with little in parsing. Run
+  multiple sessions to scale past it.
 - **The wire format is clean-slate**, so both ends must run this library. It
   is not yamux-compatible and never will be.
 - Prefer HTTP/2 or WebSocket when an on-path L7 proxy has to parse your

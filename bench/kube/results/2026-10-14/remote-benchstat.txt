@@ -1,0 +1,35 @@
+                              │ control │ candidate │
+                              │                             sec/op                              │                   sec/op                    vs base              │
+Remote/wrapped/rrload-4-8                                                           1.660 ± 46%                                  1.971 ± 45%       ~ (p=0.818 n=6)
+Remote/tls/rrload-4-8                                                              413.9m ± 16%                                 398.0m ± 10%       ~ (p=0.589 n=6)
+Remote/tls-batched/rrload-4-8                                                      637.9m ± 13%                                 621.4m ± 23%       ~ (p=0.818 n=6)
+Remote/tcp/bulk-8-8                                                                175.9m ± 12%                                 177.2m ±  4%       ~ (p=0.485 n=6)
+Remote/wrapped/bulk-8-8                                                            177.0m ±  4%                                 172.9m ± 10%       ~ (p=0.394 n=6)
+geomean                                                                            423.7m                                       431.3m        +1.81%
+
+                              │ control │ candidate │
+                              │                             p50-us                              │                   p50-us                    vs base              │
+Remote/wrapped/rrload-4-8                                                          3.189k ± 59%                                 4.119k ± 63%       ~ (p=0.485 n=6)
+Remote/tls/rrload-4-8                                                               771.3 ± 11%                                  747.6 ± 14%       ~ (p=0.394 n=6)
+Remote/tls-batched/rrload-4-8                                                      1.168k ± 19%                                 1.172k ± 31%       ~ (p=0.589 n=6)
+geomean                                                                            1.422k                                       1.534k        +7.91%
+
+                              │ control │ candidate │
+                              │                             p99-us                              │                   p99-us                    vs base              │
+Remote/wrapped/rrload-4-8                                                          8.860k ± 30%                                 7.826k ± 22%       ~ (p=0.589 n=6)
+Remote/tls/rrload-4-8                                                              1.912k ± 73%                                 1.679k ± 34%       ~ (p=0.699 n=6)
+Remote/tls-batched/rrload-4-8                                                      2.482k ± 14%                                 2.360k ± 55%       ~ (p=0.589 n=6)
+geomean                                                                            3.478k                                       3.142k        -9.66%
+
+                              │ control │ candidate │
+                              │                           load-MiB/s                            │                 load-MiB/s                  vs base              │
+Remote/wrapped/rrload-4-8                                                          2.374k ± 12%                                 2.329k ± 10%       ~ (p=0.180 n=6)
+Remote/tls/rrload-4-8                                                              1.759k ±  4%                                 1.791k ±  8%       ~ (p=0.699 n=6)
+Remote/tls-batched/rrload-4-8                                                      2.096k ±  3%                                 2.155k ± 10%       ~ (p=0.132 n=6)
+geomean                                                                            2.061k                                       2.079k        +0.87%
+
+                        │ control │ candidate │
+                        │                             Gbit/s                              │                   Gbit/s                    vs base              │
+Remote/tcp/bulk-8-8                                                           48.84 ± 11%                                  48.49 ±  5%       ~ (p=0.485 n=6)
+Remote/wrapped/bulk-8-8                                                       48.53 ±  4%                                  49.68 ± 11%       ~ (p=0.394 n=6)
+geomean                                                                       48.68                                        49.08        +0.83%

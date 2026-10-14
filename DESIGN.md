@@ -40,16 +40,14 @@ design diff), with all surviving amendments folded in.
 
 - TCP head-of-line blocking: one lost packet stalls every stream on a TCP
   carrier. QUIC's genuine advantage; no userspace mux fixes it.
-- A session's receive side is one goroutine, bounded by a single core's
-  parse + memcpy throughput (tens of Gb/s). Scale past it with multiple
-  sessions; the splice relay path bypasses userspace entirely. Measured
-  between two hosts on a 9000-byte-MTU network, one session tops out near
-  50 Gbit/s whether it carries 1, 8 or 64 streams, where eight separate
-  TCP connections reach 129 (bench/BASELINE.md, "Two hosts"). The split
-  between this ceiling and the next one is inferred, not measured: a
-  single bare TCP connection managed 40 Gbit/s in the same run, so one
-  flow is not obviously the limit, but the reader was not profiled
-  during it. Profiling it is the first step toward moving the ceiling.
+- A session's receive side is one goroutine. Between two hosts on a
+  9000-byte-MTU network, one session tops out near 50 Gbit/s whether it
+  carries 1, 8 or 64 streams, where eight separate TCP connections reach
+  129 (bench/BASELINE.md, "Two hosts"). A later receive-side CPU profile
+  during a sustained transfer puts 81% of samples in syscalls, 9% in
+  copying, and little in parsing or dispatch; readLoop consumes nearly
+  one full core. The next levers are read-syscall amortization and
+  multiple sessions. Copy elimination alone has limited headroom here.
 - One carrier means one TCP flow's congestion window. Striping is a v2
   candidate (see SETTINGS reserved bits).
 - Autotuning sizes the window for throughput, and on a session that also
@@ -256,20 +254,25 @@ Write deadlines and stalled peers:
 
 Carrier realities:
 
-- `net.Buffers` becomes writev **only on an exact `*net.TCPConn`** — the
-  enabling interface inside `net` is unexported, so no wrapper can
-  implement it; wrapped carriers (and Windows) degrade to one `Write` per
-  buffer. The session detects the carrier type once and coalesces the batch
-  into a contiguous buffer (preallocated at the batch cap) for anything
-  that is not exactly a TCP conn.
+- `net.Buffers` uses vectored writes on concrete `*net.TCPConn` and
+  `*net.UnixConn` carriers. The enabling interface inside `net` is unexported;
+  wrappers exposing only `net.Conn` do not inherit it. The session detects
+  the socket types once and coalesces batches for other carriers into
+  contiguous 64KB writes, honoring the wrapper's own Write behavior. A whole
+  batch per Write was faster on loopback but slower on a real NIC; 64KB was
+  the better balance in the sweep. Recent small DATA frames keep the original
+  16KB chunks for the same 10ms quiet period used by the bulk-batch limit,
+  preserving the interactive path while bulk-only sessions use larger writes.
+  TCP uses writev on Unix and WSASend on Windows.
 - **TLS:** one `tls.Conn.Write` per batch, but `crypto/tls` splits it into
   ≤16KB plaintext records, each written to the carrier separately — and
   dynamic record sizing (on by default) starts records near ~1.2KB until
   128KB have been sent on the connection. Batching still wins (one record
   per 16KB instead of one per small frame), but it is **not** one syscall
-  per batch: chunk the coalesce at 16KB so no memcpy exceeds what a record
-  carries, and document `DynamicRecordSizingDisabled: true` for bulk-TLS
-  users. Zero-copy does not exist on TLS at all — crypto/tls copies and
+  per batch. Pass the coalesced chunks to TLS and let it cut records;
+  splitting at 16KB above TLS adds Write calls without avoiding the
+  coalescing copy. `DynamicRecordSizingDisabled: true` is available to
+  bulk-TLS users. Zero-copy does not exist on TLS at all — crypto/tls copies and
   encrypts into its own record buffer regardless. The per-record write can
   only be fixed from beneath the `tls.Conn`: `Batched` wraps the transport
   before TLS is layered on it, and the session holds each batch's records

@@ -1,0 +1,75 @@
+# Two-node benchmark workers. Apply with an explicit kubeconfig/context.
+# No service exposes the benchmark listeners outside the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portunus-bench
+  labels:
+    app.kubernetes.io/name: portunus-bench
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-server
+  namespace: portunus-bench
+  labels:
+    app: portunus-bench
+    role: server
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  containers:
+  - name: bench
+    image: golang:1.27.2-bookworm
+    workingDir: /bench
+    command: ["sleep", "86400"]
+    resources:
+      requests:
+        cpu: "8"
+        memory: 2Gi
+      limits:
+        cpu: "8"
+        memory: 4Gi
+    volumeMounts:
+    - name: work
+      mountPath: /bench
+  volumes:
+  - name: work
+    emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-client
+  namespace: portunus-bench
+  labels:
+    app: portunus-bench
+    role: client
+spec:
+  automountServiceAccountToken: false
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: portunus-bench
+        topologyKey: kubernetes.io/hostname
+  terminationGracePeriodSeconds: 5
+  containers:
+  - name: bench
+    image: golang:1.27.2-bookworm
+    workingDir: /bench
+    command: ["sleep", "86400"]
+    resources:
+      requests:
+        cpu: "8"
+        memory: 2Gi
+      limits:
+        cpu: "8"
+        memory: 4Gi
+    volumeMounts:
+    - name: work
+      mountPath: /bench
+  volumes:
+  - name: work
+    emptyDir: {}

@@ -1,0 +1,126 @@
+goos: linux
+goarch: amd64
+pkg: github.com/giraffesyo/portunus/bench
+cpu: AMD EPYC 9655P 96-Core Processor
+BenchmarkBulkMux-8          	  177733	      6721 ns/op	9751.42 MB/s	       8 B/op	       0 allocs/op
+BenchmarkBulkLargeMux-8     	   15808	     76377 ns/op	13728.97 MB/s	      90 B/op	       0 allocs/op
+BenchmarkSmallMsgsMux-8     	 8893826	       133.4 ns/op	1918.97 MB/s	       1 B/op	       0 allocs/op
+BenchmarkEchoRTTMux-8       	  107212	     10608 ns/op	      53 B/op	       1 allocs/op
+BenchmarkStreamChurnMux-8   	  221494	      5469 ns/op	    1382 B/op	      12 allocs/op
+BenchmarkRelayMux-8         	  159014	      6929 ns/op	9457.83 MB/s	     118 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/64K-8         	  179988	      6762 ns/op	9691.68 MB/s	       8 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/1M-8          	   16310	     74134 ns/op	14144.27 MB/s	     170 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/64K-8     	   79525	     15027 ns/op	4361.26 MB/s	      16 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/1M-8      	    5582	    211228 ns/op	4964.18 MB/s	     565 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/64K-8        	  160660	      7480 ns/op	8761.00 MB/s	      10 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/1M-8         	   12036	     98251 ns/op	10672.38 MB/s	     301 B/op	       0 allocs/op
+BenchmarkCarrierMux/tls/64K-8         	   47452	     25297 ns/op	2590.69 MB/s	     164 B/op	       4 allocs/op
+BenchmarkCarrierMux/tls/1M-8          	    3218	    368192 ns/op	2847.91 MB/s	    2581 B/op	      67 allocs/op
+BenchmarkCarrierMux/tls-batched/64K-8 	   65804	     18253 ns/op	3590.41 MB/s	      76 B/op	       2 allocs/op
+BenchmarkCarrierMux/tls-batched/1M-8  	    4202	    267731 ns/op	3916.52 MB/s	    1831 B/op	      32 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/giraffesyo/portunus/bench
+cpu: AMD EPYC 9655P 96-Core Processor
+BenchmarkBulkMux-8          	  178843	      6895 ns/op	9504.93 MB/s	       8 B/op	       0 allocs/op
+BenchmarkBulkLargeMux-8     	   16732	     72965 ns/op	14370.99 MB/s	      62 B/op	       0 allocs/op
+BenchmarkSmallMsgsMux-8     	 7070239	       148.7 ns/op	1721.40 MB/s	       1 B/op	       0 allocs/op
+BenchmarkEchoRTTMux-8       	  115120	     10727 ns/op	      50 B/op	       1 allocs/op
+BenchmarkStreamChurnMux-8   	  224649	      5430 ns/op	    1381 B/op	      12 allocs/op
+BenchmarkRelayMux-8         	  170800	      7278 ns/op	9004.69 MB/s	     212 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/64K-8         	  176425	      6784 ns/op	9659.93 MB/s	      10 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/1M-8          	   15961	     76003 ns/op	13796.49 MB/s	     171 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/64K-8     	   79249	     15003 ns/op	4368.23 MB/s	      21 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/1M-8      	    5607	    209704 ns/op	5000.28 MB/s	     551 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/64K-8        	  161726	      7338 ns/op	8931.16 MB/s	      10 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/1M-8         	   10000	    103540 ns/op	10127.30 MB/s	     343 B/op	       0 allocs/op
+BenchmarkCarrierMux/tls/64K-8         	   47491	     25339 ns/op	2586.41 MB/s	     154 B/op	       4 allocs/op
+BenchmarkCarrierMux/tls/1M-8          	    3198	    384703 ns/op	2725.68 MB/s	    2539 B/op	      66 allocs/op
+BenchmarkCarrierMux/tls-batched/64K-8 	   66027	     18073 ns/op	3626.15 MB/s	      76 B/op	       2 allocs/op
+BenchmarkCarrierMux/tls-batched/1M-8  	    4096	    271376 ns/op	3863.92 MB/s	    1840 B/op	      32 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/giraffesyo/portunus/bench
+cpu: AMD EPYC 9655P 96-Core Processor
+BenchmarkBulkMux-8          	  176832	      6726 ns/op	9743.21 MB/s	      10 B/op	       0 allocs/op
+BenchmarkBulkLargeMux-8     	   16092	     74758 ns/op	14026.28 MB/s	      88 B/op	       0 allocs/op
+BenchmarkSmallMsgsMux-8     	13662450	       123.4 ns/op	2074.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkEchoRTTMux-8       	  116521	     11221 ns/op	      48 B/op	       1 allocs/op
+BenchmarkStreamChurnMux-8   	  215886	      5422 ns/op	    1384 B/op	      12 allocs/op
+BenchmarkRelayMux-8         	  162231	      7154 ns/op	9161.27 MB/s	     224 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/64K-8         	  177110	      6726 ns/op	9743.44 MB/s	       6 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/1M-8          	   16396	     74770 ns/op	14024.11 MB/s	     142 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/64K-8     	   79471	     15006 ns/op	4367.45 MB/s	      27 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/1M-8      	    5551	    209603 ns/op	5002.67 MB/s	     521 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/64K-8        	  165993	      7239 ns/op	9052.69 MB/s	       9 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/1M-8         	    9903	    102643 ns/op	10215.80 MB/s	     338 B/op	       0 allocs/op
+BenchmarkCarrierMux/tls/64K-8         	   45423	     25589 ns/op	2561.12 MB/s	     155 B/op	       4 allocs/op
+BenchmarkCarrierMux/tls/1M-8          	    3217	    372430 ns/op	2815.50 MB/s	    2518 B/op	      66 allocs/op
+BenchmarkCarrierMux/tls-batched/64K-8 	   65974	     18048 ns/op	3631.18 MB/s	      76 B/op	       2 allocs/op
+BenchmarkCarrierMux/tls-batched/1M-8  	    4261	    269759 ns/op	3887.09 MB/s	    1787 B/op	      32 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/giraffesyo/portunus/bench
+cpu: AMD EPYC 9655P 96-Core Processor
+BenchmarkBulkMux-8          	  177486	      6630 ns/op	9884.78 MB/s	       6 B/op	       0 allocs/op
+BenchmarkBulkLargeMux-8     	   15904	     75309 ns/op	13923.66 MB/s	     103 B/op	       0 allocs/op
+BenchmarkSmallMsgsMux-8     	11000016	       131.9 ns/op	1940.84 MB/s	       1 B/op	       0 allocs/op
+BenchmarkEchoRTTMux-8       	  114021	     10748 ns/op	      50 B/op	       1 allocs/op
+BenchmarkStreamChurnMux-8   	  217956	      5448 ns/op	    1384 B/op	      12 allocs/op
+BenchmarkRelayMux-8         	  157506	      6899 ns/op	9498.93 MB/s	     102 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/64K-8         	  176397	      6725 ns/op	9745.10 MB/s	       8 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/1M-8          	   15882	     74276 ns/op	14117.27 MB/s	     106 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/64K-8     	   73504	     15064 ns/op	4350.64 MB/s	      13 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/1M-8      	    5484	    223371 ns/op	4694.33 MB/s	     456 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/64K-8        	  163548	      7349 ns/op	8917.90 MB/s	      10 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/1M-8         	    9876	    102137 ns/op	10266.33 MB/s	     345 B/op	       0 allocs/op
+BenchmarkCarrierMux/tls/64K-8         	   45966	     25636 ns/op	2556.37 MB/s	     158 B/op	       4 allocs/op
+BenchmarkCarrierMux/tls/1M-8          	    3114	    380175 ns/op	2758.14 MB/s	    2553 B/op	      67 allocs/op
+BenchmarkCarrierMux/tls-batched/64K-8 	   65126	     18373 ns/op	3566.92 MB/s	      78 B/op	       2 allocs/op
+BenchmarkCarrierMux/tls-batched/1M-8  	    4348	    270292 ns/op	3879.42 MB/s	    1748 B/op	      32 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/giraffesyo/portunus/bench
+cpu: AMD EPYC 9655P 96-Core Processor
+BenchmarkBulkMux-8          	  176856	      6769 ns/op	9681.69 MB/s	       8 B/op	       0 allocs/op
+BenchmarkBulkLargeMux-8     	   15556	     76356 ns/op	13732.72 MB/s	      83 B/op	       0 allocs/op
+BenchmarkSmallMsgsMux-8     	 8677957	       155.5 ns/op	1646.27 MB/s	       1 B/op	       0 allocs/op
+BenchmarkEchoRTTMux-8       	  115590	     10409 ns/op	      52 B/op	       1 allocs/op
+BenchmarkStreamChurnMux-8   	  216385	      5473 ns/op	    1384 B/op	      12 allocs/op
+BenchmarkRelayMux-8         	  182542	      7096 ns/op	9235.66 MB/s	     202 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/64K-8         	  177540	      6768 ns/op	9683.27 MB/s	      12 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/1M-8          	   16372	     73447 ns/op	14276.63 MB/s	     144 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/64K-8     	   76654	     15416 ns/op	4251.28 MB/s	      11 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/1M-8      	    5263	    214266 ns/op	4893.79 MB/s	     513 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/64K-8        	  166575	      7190 ns/op	9115.22 MB/s	      11 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/1M-8         	   12481	     96966 ns/op	10813.86 MB/s	     264 B/op	       0 allocs/op
+BenchmarkCarrierMux/tls/64K-8         	   47323	     25364 ns/op	2583.80 MB/s	     159 B/op	       4 allocs/op
+BenchmarkCarrierMux/tls/1M-8          	    3124	    382407 ns/op	2742.04 MB/s	    2535 B/op	      67 allocs/op
+BenchmarkCarrierMux/tls-batched/64K-8 	   64922	     18251 ns/op	3590.86 MB/s	      77 B/op	       2 allocs/op
+BenchmarkCarrierMux/tls-batched/1M-8  	    4219	    270414 ns/op	3877.67 MB/s	    1792 B/op	      32 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/giraffesyo/portunus/bench
+cpu: AMD EPYC 9655P 96-Core Processor
+BenchmarkBulkMux-8          	  176796	      6716 ns/op	9758.41 MB/s	       7 B/op	       0 allocs/op
+BenchmarkBulkLargeMux-8     	   16112	     72822 ns/op	14399.09 MB/s	      92 B/op	       0 allocs/op
+BenchmarkSmallMsgsMux-8     	12285884	       156.0 ns/op	1641.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkEchoRTTMux-8       	  109032	     10462 ns/op	      50 B/op	       1 allocs/op
+BenchmarkStreamChurnMux-8   	  194823	      5409 ns/op	    1383 B/op	      12 allocs/op
+BenchmarkRelayMux-8         	  183268	      7123 ns/op	9201.09 MB/s	     198 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/64K-8         	  175800	      6613 ns/op	9910.56 MB/s	       7 B/op	       0 allocs/op
+BenchmarkCarrierMux/tcp/1M-8          	   16582	     72132 ns/op	14536.98 MB/s	      89 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/64K-8     	   79515	     15161 ns/op	4322.66 MB/s	       9 B/op	       0 allocs/op
+BenchmarkCarrierMux/wrapped/1M-8      	    5547	    213719 ns/op	4906.33 MB/s	     842 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/64K-8        	  167404	      7320 ns/op	8953.47 MB/s	       9 B/op	       0 allocs/op
+BenchmarkCarrierMux/unix/1M-8         	   12483	     97228 ns/op	10784.70 MB/s	     264 B/op	       0 allocs/op
+BenchmarkCarrierMux/tls/64K-8         	   47480	     25397 ns/op	2580.43 MB/s	     155 B/op	       4 allocs/op
+BenchmarkCarrierMux/tls/1M-8          	    3134	    375642 ns/op	2791.42 MB/s	    2549 B/op	      66 allocs/op
+BenchmarkCarrierMux/tls-batched/64K-8 	   65634	     18120 ns/op	3616.78 MB/s	      79 B/op	       2 allocs/op
+BenchmarkCarrierMux/tls-batched/1M-8  	    4339	    269301 ns/op	3893.70 MB/s	    1776 B/op	      32 allocs/op
+PASS

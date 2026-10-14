@@ -54,6 +54,7 @@ import (
 const preambleSize = 256
 
 type preamble struct {
+	Carrier     string `json:"carrier,omitempty"`
 	Impl        string `json:"impl"`
 	Scenario    string `json:"scenario"`
 	Streams     int    `json:"streams"`
@@ -103,6 +104,7 @@ func main() {
 		listen    = flag.String("listen", ":7777", "server listen address")
 		addr      = flag.String("addr", "", "server address to dial")
 		impl      = flag.String("impl", "portunus", "portunus, yamux, or raw")
+		carrier   = flag.String("carrier", "tcp", "tcp, wrapped, tls, or tls-batched (test-network TLS only)")
 		scenario  = flag.String("scenario", "bulk", "bulk, rr, rrload, or open")
 		streams   = flag.Int("streams", 1, "concurrent streams")
 		bytesFlag = flag.Int64("bytes", 256<<20, "payload bytes per stream for bulk")
@@ -144,7 +146,8 @@ func main() {
 			log.Fatal("client mode needs -addr")
 		}
 		p := preamble{
-			Impl: *impl, Scenario: *scenario,
+			Carrier: *carrier,
+			Impl:    *impl, Scenario: *scenario,
 			Streams: *streams, Size: *size, YamuxWindow: *ywin,
 			InitWindow: *iw, MaxWindow: *mw, RecvBuf: *rb, MaxFrame: *mf,
 			MaxBatch: *mb, NotSent: *nsl, RecvBudget: *rbg,
@@ -155,6 +158,7 @@ func main() {
 			log.Fatal(err)
 		}
 		res.Label = *label
+		res.Carrier = *carrier
 		res.Procs = runtime.GOMAXPROCS(0)
 		if *impl == "yamux" {
 			res.YamuxWindow = *ywin
@@ -181,9 +185,10 @@ func main() {
 // N is a measure of how quiet the host happened to be, not of the library.
 func aggregate(in io.Reader, out io.Writer) error {
 	type key struct {
-		label  string
-		impl   string
-		window int
+		label   string
+		impl    string
+		carrier string
+		window  int
 	}
 	groups := map[key][]Result{}
 	var order []key
@@ -199,7 +204,7 @@ func aggregate(in io.Reader, out io.Writer) error {
 		if r.Scenario == "" {
 			continue // a failed run, recorded so the gap is visible
 		}
-		k := key{r.Label, r.Impl, r.YamuxWindow}
+		k := key{r.Label, r.Impl, r.Carrier, r.YamuxWindow}
 		if _, seen := groups[k]; !seen {
 			order = append(order, k)
 		}
@@ -211,8 +216,11 @@ func aggregate(in io.Reader, out io.Writer) error {
 	for _, k := range order {
 		g := groups[k]
 		name := k.impl
+		if k.carrier != "" && k.carrier != "tcp" {
+			name += "/" + k.carrier
+		}
 		if k.window > 0 {
-			name = fmt.Sprintf("%s (%dKB win)", k.impl, k.window/1024)
+			name = fmt.Sprintf("%s (%dKB win)", name, k.window/1024)
 		}
 		fmt.Fprintf(out, "| %s | %s | %d | %s | %s | %s | %s | %s | %s |\n",
 			k.label, name, len(g),
@@ -357,7 +365,7 @@ func (r rawStream) Read(p []byte) (int, error)  { return r.c.Read(p) }
 func (r rawStream) Write(p []byte) (int, error) { return r.c.Write(p) }
 func (r rawStream) Close() error                { return nil }
 func (r rawStream) CloseWrite() error {
-	if c, ok := r.c.(*net.TCPConn); ok {
+	if c, ok := r.c.(interface{ CloseWrite() error }); ok {
 		return c.CloseWrite()
 	}
 	return nil
@@ -483,7 +491,11 @@ func handle(c net.Conn, verbose bool) error {
 		return fmt.Errorf("congestion control %q: %w", p.CC, err)
 	}
 
-	sess, err := serveSession(c, p)
+	carrier, err := wrapCarrier(c, p.Carrier, true)
+	if err != nil {
+		return err
+	}
+	sess, err := serveSession(carrier, p)
 	if err != nil {
 		return err
 	}
@@ -497,9 +509,9 @@ func handle(c net.Conn, verbose bool) error {
 		defer func() {
 			if ps, ok := sess.(portunusSession); ok {
 				st := ps.s.Stats()
-				log.Printf("%s/%s streams=%d: stalls=%d rtt=%v target=%d granted=%d recv=%d frames/flush=%.1f",
+				log.Printf("%s/%s streams=%d: stalls=%d rtt=%v target=%d pathBDP=%d granted=%d recv=%d frames/flush=%.1f",
 					p.Impl, p.Scenario, p.Streams,
-					st.WindowStalls, st.RTT, st.WindowTarget,
+					st.WindowStalls, st.RTT, st.WindowTarget, st.PathBDP,
 					st.GrantedBytes, st.BytesReceived, st.FramesPerFlush)
 			}
 		}()
@@ -632,6 +644,7 @@ func awaitPeerHangup(ctx context.Context, sess session) {
 // Result is one benchmark run. Absent fields are those the scenario does not
 // measure.
 type Result struct {
+	Carrier  string `json:"carrier,omitempty"`
 	Label    string `json:"label,omitempty"`
 	Impl     string `json:"impl"`
 	Scenario string `json:"scenario"`
@@ -707,7 +720,16 @@ func dial(addr string, p preamble) (session, error) {
 	if _, err := c.Write(buf); err != nil {
 		return nil, err
 	}
-	return dialSession(c, p)
+	carrier, err := wrapCarrier(c, p.Carrier, false)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	sess, err := dialSession(carrier, p)
+	if err != nil {
+		c.Close()
+	}
+	return sess, err
 }
 
 func clientBulk(ctx context.Context, sess session, p preamble, payload int64) (Result, error) {

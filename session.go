@@ -407,7 +407,7 @@ func (s *NativeSession) readLoop() {
 			return
 		}
 		// DATA payloads land in pooled segments; when a payload runs past
-		// what the (deliberately small) parse buffer holds, bufio hands
+		// what the parse buffer holds, bufio hands
 		// the remainder straight to ReadFull, so bulk bytes go
 		// kernel-to-segment with no intermediate copy. Control payloads
 		// are parsed immediately and never retained, so they use a

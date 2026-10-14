@@ -1,0 +1,37 @@
+goos: linux
+goarch: amd64
+pkg: github.com/giraffesyo/portunus/bench
+cpu: AMD EPYC 9655P 96-Core Processor
+                         │ control │ candidate │
+                         │                          sec/op                          │             sec/op               vs base               │
+CarrierMux/wrapped/64K-8                                               15.460µ ± 5%                       9.218µ ± 6%  -40.37% (p=0.002 n=6)
+CarrierMux/wrapped/1M-8                                                 210.6µ ± 7%                       123.7µ ± 1%  -41.25% (p=0.002 n=6)
+CarrierMux/unix/64K-8                                                   7.413µ ± 2%                       3.638µ ± 3%  -50.92% (p=0.002 n=6)
+CarrierMux/unix/1M-8                                                   101.76µ ± 5%                       51.89µ ± 3%  -49.01% (p=0.002 n=6)
+geomean                                                                 39.59µ                            21.54µ       -45.59%
+
+                         │ control │ candidate │
+                         │                           B/s                            │              B/s                vs base                │
+CarrierMux/wrapped/64K-8                                               3.948Gi ± 5%                     6.621Gi ± 6%   +67.71% (p=0.002 n=6)
+CarrierMux/wrapped/1M-8                                                4.637Gi ± 7%                     7.893Gi ± 1%   +70.22% (p=0.002 n=6)
+CarrierMux/unix/64K-8                                                  8.235Gi ± 2%                    16.780Gi ± 3%  +103.76% (p=0.002 n=6)
+CarrierMux/unix/1M-8                                                   9.600Gi ± 5%                    18.821Gi ± 3%   +96.06% (p=0.002 n=6)
+geomean                                                                6.168Gi                          11.33Gi        +83.77%
+
+                         │ control │ candidate │
+                         │                           B/op                           │              B/op                vs base               │
+CarrierMux/wrapped/64K-8                                                18.00 ± 17%                      12.50 ±  20%  -30.56% (p=0.002 n=6)
+CarrierMux/wrapped/1M-8                                                 451.5 ± 76%                      312.0 ±  19%  -30.90% (p=0.002 n=6)
+CarrierMux/unix/64K-8                                                   9.000 ± 33%                      8.500 ± 124%        ~ (p=0.238 n=6)
+CarrierMux/unix/1M-8                                                   280.50 ± 10%                      60.50 ± 145%  -78.43% (p=0.002 n=6)
+geomean                                                                 67.30                            37.63         -44.08%
+
+                         │ control │ candidate │
+                         │                        allocs/op                         │           allocs/op             vs base                │
+CarrierMux/wrapped/64K-8                                               0.000 ± 0%                         0.000 ± 0%       ~ (p=1.000 n=6) ¹
+CarrierMux/wrapped/1M-8                                                0.000 ± 0%                         0.000 ± 0%       ~ (p=1.000 n=6) ¹
+CarrierMux/unix/64K-8                                                  0.000 ± 0%                         0.000 ± 0%       ~ (p=1.000 n=6) ¹
+CarrierMux/unix/1M-8                                                   0.000 ± 0%                         0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                           ²                                   +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean

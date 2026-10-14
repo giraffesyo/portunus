@@ -3,6 +3,7 @@ package portunus
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -37,9 +38,10 @@ const (
 	// the goroutine park it would otherwise cost.
 	zeroCopyThreshold = 4 << 10
 
-	// tlsRecordSize is crypto/tls's maximum plaintext record. Coalesced
-	// writes are chunked to it so no copy exceeds what one record carries.
-	tlsRecordSize = 16 << 10
+	// coalescedWriteSize balances syscall count against carrier packetization.
+	// Whole-batch writes won on loopback but regressed wrapped TCP across
+	// hosts; 64KB chunks recovered throughput in the real-NIC sweep.
+	coalescedWriteSize = 64 << 10
 
 	// smallWriteReserve is batch space kept clear of bulk writes so small
 	// messages always have somewhere to land. It bounds how long a small
@@ -105,7 +107,7 @@ func shardCount() uint32 {
 
 type writer struct {
 	s       *NativeSession
-	tcp     *net.TCPConn // non-nil when net.Buffers becomes a real writev
+	vector  net.Conn     // TCP or Unix stream socket: net.Buffers uses vectored I/O
 	batched *batchedConn // non-nil when the carrier sits on a Batched wrapper
 
 	mu sync.Mutex
@@ -231,11 +233,11 @@ func newWriter(s *NativeSession) *writer {
 	// One shard may hold what one stream may put in a batch: it serves a
 	// few streams, and should not take more of the batch than one could.
 	w.shardCap = s.cfg.PerStreamBatchBytes
-	// net.Buffers only becomes writev on an exact *net.TCPConn: the
-	// enabling interface inside net is unexported, so no wrapper can
-	// implement it. Anything else is coalesced into one contiguous write.
-	if tcp, ok := s.conn.(*net.TCPConn); ok {
-		w.tcp = tcp
+	// Both socket types inherit net's internal vectored-write method.
+	// Keep wrappers on the coalesced path so their Write behavior is honored.
+	switch s.conn.(type) {
+	case *net.TCPConn, *net.UnixConn:
+		w.vector = s.conn
 	}
 	w.batched = batchedUnder(s.conn)
 	// One frame until the first flush has measured the carrier.
@@ -1131,7 +1133,7 @@ func (w *writer) writeOut(now time.Time) error {
 		w.fpingStamp = false
 	}
 
-	if w.tcp != nil {
+	if w.vector != nil {
 		// net.Buffers.WriteTo issues writev, looping past the 1024-iovec
 		// kernel limit, so a flush is not assumed to be one syscall.
 		//
@@ -1145,14 +1147,22 @@ func (w *writer) writeOut(now time.Time) error {
 		// has a pointer receiver: taking the address of a local makes it
 		// escape, which is an allocation on every flush.
 		w.iovOut = w.iov
-		_, err := w.iovOut.WriteTo(w.tcp)
+		_, err := w.iovOut.WriteTo(w.vector)
 		return err
 	}
 
-	// Any other carrier (TLS, wrappers, Windows) gets one contiguous write
-	// instead of one write per buffer. Over TLS this is still split into
-	// 16KB records by crypto/tls, each its own carrier write; chunking the
-	// copy at that size keeps no memcpy larger than a record can carry.
+	// Other carriers get contiguous writes in bounded chunks. Larger chunks
+	// cut the Write count, but sending the entire batch at once regressed
+	// wrapped TCP throughput on a real NIC. TLS handles record boundaries
+	// within each chunk.
+	writeSize := coalescedWriteSize
+	// Keep the original chunk size while interactive traffic is present,
+	// using the same quiet period that bounds bulk batching. Larger writes
+	// help bulk sessions, but mixed-workload tails trended higher with them.
+	// smallAt is only changed by the flusher, after each completed write.
+	if now.Sub(w.smallAt) < burstQuiet {
+		writeSize = 16 << 10
+	}
 	w.coalesce = w.coalesce[:0]
 	for _, b := range w.iov {
 		w.coalesce = append(w.coalesce, b...)
@@ -1173,8 +1183,12 @@ func (w *writer) writeOut(now time.Time) error {
 	}
 	var err error
 	for buf := w.coalesce; len(buf) > 0 && err == nil; {
-		n := min(len(buf), tlsRecordSize)
-		_, err = w.s.conn.Write(buf[:n])
+		n := min(len(buf), writeSize)
+		var written int
+		written, err = w.s.conn.Write(buf[:n])
+		if err == nil && written != n {
+			err = io.ErrShortWrite
+		}
 		buf = buf[n:]
 	}
 	if w.batched != nil {

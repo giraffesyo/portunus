@@ -24,14 +24,9 @@ import (
 	"github.com/giraffesyo/portunus/conformance"
 )
 
-// Carriers other than an exact *net.TCPConn take a different send path.
-//
-// net.Buffers only becomes writev on a concrete *net.TCPConn — the enabling
-// interface inside package net is unexported, so no wrapper can implement it.
-// Everything else is coalesced into one contiguous write and chunked at the
-// TLS record size. That covers TLS, any wrapped connection, and every write
-// on Windows, which is a large share of real deployments running a code path
-// the TCP tests never reach.
+// TCP and Unix stream sockets use vectored writes. Other carriers receive a
+// contiguous writes in bounded chunks, preserving wrappers' Write behavior
+// and letting TLS choose its own record boundaries within each chunk.
 
 // tlsPair returns two connected TLS connections whose handshake has already
 // completed.
@@ -232,12 +227,12 @@ func TestBatchedTLSWritesOncePerBatch(t *testing.T) {
 }
 
 // TestConformanceOverUnix covers a stream carrier that is neither TCP nor
-// TLS: the local-socket case, where the coalesce path also applies.
+// TLS: the local-socket case, which also supports vectored writes.
 func TestConformanceOverUnix(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		// Modern Windows has AF_UNIX, but path handling and cleanup differ
 		// enough that a failure here would say more about the test than the
-		// library. The coalesce path it exercises is covered there by TLS.
+		// library.
 		t.Skip("unix sockets behave differently on Windows")
 	}
 	conformance.Run(t, func(t *testing.T) (portunus.Session, portunus.Session) {

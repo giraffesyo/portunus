@@ -1,0 +1,93 @@
+File: remote-after
+Build ID: 5e5f6d6498b7c3bdd2528306bd8dcbd192b3f1bf
+Type: cpu
+Time: 2026-10-14 18:58:07 UTC
+Duration: 10s, Total samples = 11.10s (111.00%)
+Showing nodes accounting for 10.66s, 96.04% of 11.10s total
+Dropped 59 nodes (cum <= 0.06s)
+Showing top 25 nodes out of 57
+      flat  flat%   sum%        cum   cum%
+     8.99s 80.99% 80.99%      8.99s 80.99%  internal/runtime/syscall/linux.Syscall6
+     0.98s  8.83% 89.82%      0.98s  8.83%  runtime.memmove
+     0.18s  1.62% 91.44%      0.45s  4.05%  runtime.stealWork
+     0.14s  1.26% 92.70%      0.14s  1.26%  runtime.futex
+     0.09s  0.81% 93.51%      0.09s  0.81%  runtime.nanotime (inline)
+     0.09s  0.81% 94.32%      0.11s  0.99%  runtime.runqgrab
+     0.04s  0.36% 94.68%      1.05s  9.46%  runtime.findRunnable
+     0.02s  0.18% 94.86%      9.53s 85.86%  bufio.(*Reader).Read
+     0.02s  0.18% 95.05%      0.12s  1.08%  github.com/giraffesyo/portunus.(*NativeSession).onData
+     0.02s  0.18% 95.23%      0.08s  0.72%  github.com/giraffesyo/portunus/internal/pool.Get
+     0.02s  0.18% 95.41%      0.12s  1.08%  runtime.notesleep
+     0.01s  0.09% 95.50%      0.16s  1.44%  github.com/giraffesyo/portunus.(*NativeSession).dispatch
+     0.01s  0.09% 95.59%      0.15s  1.35%  github.com/giraffesyo/portunus.(*NativeSession).dispatchStream
+     0.01s  0.09% 95.68%      9.80s 88.29%  github.com/giraffesyo/portunus.(*NativeSession).readLoop
+     0.01s  0.09% 95.77%      9.54s 85.95%  io.ReadAtLeast
+     0.01s  0.09% 95.86%      0.34s  3.06%  runtime.netpoll
+     0.01s  0.09% 95.95%      0.12s  1.08%  runtime.runqsteal
+     0.01s  0.09% 96.04%      8.67s 78.11%  syscall.Syscall
+         0     0% 96.04%      0.13s  1.17%  github.com/giraffesyo/portunus.(*NativeSession).sendWindowUpdate
+         0     0% 96.04%      0.13s  1.17%  github.com/giraffesyo/portunus.(*NativeSession).streamControl (inline)
+         0     0% 96.04%      0.17s  1.53%  github.com/giraffesyo/portunus.(*NativeStream).WriteTo
+         0     0% 96.04%      0.13s  1.17%  github.com/giraffesyo/portunus.(*writer).appendStreamControl
+         0     0% 96.04%      0.18s  1.62%  github.com/giraffesyo/portunus.(*writer).flushLoop
+         0     0% 96.04%      0.17s  1.53%  github.com/giraffesyo/portunus.(*writer).writeOut
+         0     0% 96.04%      0.07s  0.63%  github.com/giraffesyo/portunus.notify (inline)
+Total: 11.10s
+ROUTINE ======================== github.com/giraffesyo/portunus.(*NativeSession).readLoop in /bench/after/session.go
+      10ms      9.80s (flat, cum) 88.29% of Total
+         .          .    383:func (s *NativeSession) readLoop() {
+         .          .    384:	defer close(s.readDone)
+         .          .    385:	// A panic here would otherwise take down the host application: this
+         .          .    386:	// goroutine parses peer-controlled input, so any latent bug reachable
+         .          .    387:	// from the wire becomes a process crash for whoever imported the
+         .          .    388:	// library. Containing it to the session is the difference between one
+         .          .    389:	// broken connection and an outage.
+         .          .    390:	defer s.recoverPanic("session reader")
+         .          .    391:	br := bufio.NewReaderSize(s.conn, s.cfg.ReadBufferSize)
+         .          .    392:	var hdr [frame.HeaderSize]byte
+         .          .    393:	for {
+         .          .    394:		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+         .          .    395:			s.readEnded(err)
+         .          .    396:			return
+         .          .    397:		}
+         .          .    398:		h := frame.ParseHeader(hdr[:])
+         .          .    399:		// Also the liveness signal: keepaliveLoop watches this counter move.
+         .          .    400:		s.stats.framesReceived.Add(1)
+         .          .    401:		if h.Length > s.cfg.MaxFrameSize && h.Type == frame.TypeData {
+         .          .    402:			s.fatalProtocol(CodeFrameSize, "DATA frame exceeds MaxFrameSize")
+         .          .    403:			return
+         .          .    404:		}
+         .          .    405:		if h.Length > frame.MaxLength {
+         .          .    406:			s.fatalProtocol(CodeFrameSize, "frame too large")
+         .          .    407:			return
+         .          .    408:		}
+         .          .    409:		// DATA payloads land in pooled segments; when a payload runs past
+         .          .    410:		// what the (deliberately small) parse buffer holds, bufio hands
+         .          .    411:		// the remainder straight to ReadFull, so bulk bytes go
+         .          .    412:		// kernel-to-segment with no intermediate copy. Control payloads
+         .          .    413:		// are parsed immediately and never retained, so they use a
+         .          .    414:		// reusable scratch buffer.
+         .          .    415:		var payload []byte
+         .          .    416:		var seg pool.Buf
+         .          .    417:		if h.Length > 0 {
+         .          .    418:			if h.Type == frame.TypeData {
+         .       80ms    419:				seg = pool.Get(int(h.Length))
+         .       10ms    420:				payload = seg.Bytes()
+         .          .    421:			} else {
+         .          .    422:				if cap(s.ctlScratch) < int(h.Length) {
+         .          .    423:					s.ctlScratch = make([]byte, h.Length)
+         .          .    424:				}
+         .          .    425:				payload = s.ctlScratch[:h.Length]
+         .          .    426:			}
+      10ms      9.55s    427:			if _, err := io.ReadFull(br, payload); err != nil {
+         .          .    428:				pool.Put(seg)
+         .          .    429:				s.readEnded(err)
+         .          .    430:				return
+         .          .    431:			}
+         .          .    432:		}
+         .      160ms    433:		if err := s.dispatch(h, payload, seg); err != nil {
+         .          .    434:			return // dispatch already terminated the session
+         .          .    435:		}
+         .          .    436:	}
+         .          .    437:}
+         .          .    438:

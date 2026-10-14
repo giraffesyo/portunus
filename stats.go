@@ -34,7 +34,8 @@ type Stats struct {
 
 	// Flow control, as currently estimated.
 	RTT          time.Duration // min-filtered
-	WindowTarget uint64        // bytes, the BDP estimate
+	WindowTarget uint64        // bytes, the per-stream BDP estimate (may overshoot)
+	PathBDP      uint64        // bytes, raw measured bandwidth times min RTT
 	GrantedBytes uint64        // total receive credit outstanding
 
 	// Streams.
@@ -115,6 +116,7 @@ func (s *NativeSession) Stats() Stats {
 		WindowStalls:    s.stats.windowStalls.Load(),
 		RTT:             s.bdp.rtt(),
 		WindowTarget:    s.bdp.target(),
+		PathBDP:         s.bdp.pathBDP(),
 		StreamsOpened:   s.stats.streamsOpened.Load(),
 		StreamsAccepted: s.stats.streamsAccepted.Load(),
 		StreamsRefused:  s.stats.streamsRefused.Load(),

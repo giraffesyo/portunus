@@ -763,6 +763,95 @@ echoed bulk now moves as a relay batch.
 The two things left undone here, the writer mutex and the relay path, are
 the next section.
 
+### The BDP budget cap and the handshake probe, on the same path
+
+Measured with the BDP-derived budget cap and the handshake RTT probe applied
+on top of the build above. Neither is part of it.
+
+**The BDP budget cap counted idle streams.** Sized at three times the path
+BDP and charged with every stream's initial window, the cap was already spent
+by a dozen idle streams on a 1MB path, pinning the one stream moving data at
+its 256KB initial window — 4.7 MB/s on a 55ms path. It now bounds growth above
+initial windows only. Not addressed: the bandwidth estimate behind it is a
+maximum that never decays. Decaying it trades a cap that can only loosen for
+one that an application-limited period can tighten, and that wants a shaped
+path to judge.
+
+With both applied and the new build receiving, a 256MB transfer ran at
+19.2 MB/s against 22.2, and the
+cause is the window: every slow run ended with about 4MB granted, every fast
+one with 8MB. Two changes that arrived with the BDP budget work each hold it
+near 4MB on this path, independently:
+
+- The budget cap of three path BDPs. Disabling only the cap restored eight
+  streams of 8MB from 18.1 to 21.5 MB/s (baseline 21.4) and brought
+  small-request p50 under four bulk streams from 245ms back to 231ms
+  (baseline 236ms). BBR holds about two BDPs in flight, and credit is
+  refreshed when a quarter of the window has drained, so three BDPs of
+  window leaves almost nothing spare.
+- The handshake probe. With the cap disabled and the probe kept, three runs
+  in four still stopped at a 4MB target. The probe anchors the minimum RTT
+  at the unloaded 54ms where the baseline measures about 57ms under load,
+  and BBR's loaded round trip sits at roughly twice the base — right on the
+  "more than twice the minimum means congested" line that refuses the last
+  doubling. That reading fits the numbers but was not isolated further.
+
+The smaller window is not all cost. With one bulk stream beside the request
+stream the new build's p50 was 160ms in every batch of runs, where the
+baseline's was 152ms in one batch and 202-206ms in two; which of the two
+changes that comes from was not separated. So on BBR the cap is a trade
+again, not the free win it measured as on a CUBIC path, and the factor of
+three is the number to revisit. Left as found; the measurements are here to
+decide it with.
+
+| 54ms, 200mbit, BBR | baseline | new | new, cap disabled |
+|---|---|---|---|
+| 64MB, one stream | 19.9 MB/s | 17.9 | 17.8 (window stops at 4MB) |
+| 256MB, one stream | 22.2 MB/s | 19.2 | - |
+| 8 streams, 8MB each | 21.4 MB/s | 18.1 | 21.5 |
+| 4MB, one stream | 6.5 MB/s | 7.0 | - |
+| request p50, 1 bulk stream | 152-206 ms | 160 ms | - |
+| request p50, 4 bulk streams | 236 ms | 245 ms | 231 ms |
+
+**A later sweep settled it, under both controllers.** Same shaped path,
+three interleaved reps per cell, the cap factor, the probe and the
+congestion threshold each varied on their own.
+
+Under BBR no factor gets both axes. Each run ends with the window at
+either 4MB or 8MB, and the cap only changes how often: wherever the
+window is smaller the one-stream latency gain appears and throughput
+leaves with it (3x: 147ms one-stream p50, 19.4 MB/s single and 17.8
+eight-stream; off: 210ms, 22.2 and 21.4). The probe on its own, cap off,
+cost single-stream throughput (19.1 against 22.2) for no latency gain,
+and raising the congestion threshold from 2x to 3x did not rescue it.
+
+Under CUBIC, selected per socket on the same path, the cap's tail benefit
+turned out to be relative to the probe. With the probe on and the cap
+off, request p99 under four bulk streams reached 3.7s; the cap brings
+that configuration back to 356ms. With neither — what shipped — it was
+336ms, every throughput row was at the link, and the one-stream p50 was
+the best of any configuration at 145ms. The cap's remaining advantage was
+one median (265 against 321ms), bought with 20% of eight-stream
+throughput: the trade MaxWindow already offers. (netem's queue limit on
+loopback counts 64KB packets, so absolute CUBIC tails here are inflated;
+the comparison between configurations is what holds.)
+
+Recommendation from the data: drop the handshake probe, and with it the
+need for the cap.
+
+Applied in the carrier performance pass: both were removed. The fixed
+`MaxReceiveBudget` ceiling remains, and `Stats.PathBDP` is retained as a
+diagnostic without feeding a dynamic cap.
+
+One more thing the handshake probe changes: `TestShutdownFlushesQueuedFrames`
+fails more often with it. Over 1440 runs each on Linux under load, 3 failures
+at baseline, 12 with the probe, 1 with everything here but the probe. The
+test closes a session a few hundred microseconds after opening it; the
+likeliest mechanism is the peer's reply to the probe arriving after the
+close and resetting the connection before the peer has read the last
+frames, which is a hazard the baseline already has and the extra inbound
+frame makes likelier.
+
 ## The writer mutex, the relay path, and Close
 
 A second pass over the same ground, started from a profile of the build
@@ -909,3 +998,91 @@ interleaved passes, `benchstat` medians; every row significant at p=0.002.
 Between two hosts, from the "Two hosts" section above: bulk 52 against 26
 Gbit/s, 64-byte round trip 63.5 against 102 µs, request p50 under four bulk
 streams about 570 against 3107 µs, stream opens 11.1k against 7.5k per second.
+
+## Carrier writes and the receiver profile (2026-10-14)
+
+These measurements precede the Go 1.27.2 minimum-version update. The worker
+manifest uses that newer minimum when repeating the experiment.
+
+Go 1.26.1, linux/amd64, AMD EPYC 9655P, eight CPUs per process. Two
+Kubernetes workers on different nodes, each limited to eight CPUs and 4GiB
+of memory; 9000-byte MTU, BBR. Hosts are shared. The control uses the writer
+from ef1f43e. Both builds have the unsuccessful handshake-probe/dynamic-budget
+experiment removed and retain the raw-BDP diagnostic. Every comparison uses
+the same benchmark harness on both revisions.
+
+**Unix sockets now use vectored writes.** Go supports them as well as TCP;
+the old carrier check unnecessarily sent Unix sockets through coalescing and
+16KB writes. Other carriers now use 64KB chunks for bulk. Small DATA frames
+keep the original 16KB chunks for the existing 10ms quiet period, so the
+bulk gain does not require changing the interactive policy. A short carrier
+write is also detected and fails the session.
+
+Loopback, 16MB initial window on both builds, six interleaved one-second
+passes, alternating revision order, benchstat medians:
+
+| carrier / application write | control GiB/s | candidate GiB/s | change |
+|---|---|---|---|
+| Wrapped TCP, 64KB | 3.95 | 6.62 | +68% |
+| Wrapped TCP, 1MB | 4.64 | 7.89 | +70% |
+| Unix socket, 64KB | 8.24 | 16.78 | +104% |
+| Unix socket, 1MB | 9.60 | 18.82 | +96% |
+
+All four differences have p=0.002, n=6. All four paths remain at zero
+allocations per operation. The raw runs and full benchstat output are in
+[the dated results directory](kube/results/2026-10-14/).
+
+The two-host check uses default windows and confirms delivery before timing
+ends. Six interleaved passes on the final adaptive implementation:
+
+| workload | control | candidate | significance |
+|---|---|---|---|
+| TCP bulk, 8 streams | 48.84 Gbit/s | 48.49 Gbit/s | none, p=0.485 |
+| Wrapped TCP bulk, 8 streams | 48.53 Gbit/s | 49.68 Gbit/s | none, p=0.394 |
+| Wrapped TCP, request p99 under 4 bulk streams | 8.86ms at 2374 MiB/s | 7.83ms at 2329 MiB/s | neither axis significant |
+| TLS, request p99 under 4 bulk streams | 1.91ms at 1759 MiB/s | 1.68ms at 1791 MiB/s | neither axis significant |
+| Batched TLS, request p99 under 4 bulk streams | 2.48ms at 2096 MiB/s | 2.36ms at 2155 MiB/s | neither axis significant |
+
+The final mixed-workload check uses 500 requests per pass. Wrapped-TCP
+latency is particularly noisy: its p50 was 3.19ms at control and 4.12ms at
+candidate, p=0.485, with roughly 60% ranges. These results support a local
+carrier throughput improvement, not a claim of faster cross-host traffic or
+lower request latency.
+
+**A whole batch per carrier Write was rejected.** It improved wrapped-TCP
+loopback throughput by 2–2.5x, but the full two-host matrix put eight-stream
+throughput at 41.54 rather than 47.52 Gbit/s: a 12.6% regression, p=0.002.
+An isolated sender sweep against the same receiver tested 16KB, 64KB, 128KB
+and unlimited writes. The 64KB candidate recovered that loss. A subsequent
+full matrix with fixed 64KB chunks found no significant bulk differences,
+but mixed wrapped-TCP tails still trended higher, so recent small frames now
+retain 16KB chunks. The rejected whole-batch run, fixed-64KB run, isolated
+write-size sweep, and final adaptive check are saved separately; their files
+are labeled `full-batch-*`, `64k-*`, `write-size-sweep.jsonl`, and `remote.*`.
+The full matrices used 2000 requests per pass.
+
+**The receive ceiling is mostly kernel work.** A ten-second CPU profile
+during a sustained 128GiB transfer puts 81% of samples in syscalls, 9% in
+`memmove`, and little in parsing or dispatch. `readLoop` accounts for 9.8
+CPU-seconds in that interval, nearly one saturated core. The annotated
+profile is saved as `receiver-profile.txt` in the results directory. Raising
+the receive buffer from 256KB to 1MB moved the six-run median from 51.94 to
+54.56 Gbit/s, with overlapping ranges, for four times the parse-buffer
+memory. The default stays at 256KB. Read-syscall amortization and multiple
+sessions have more remaining scope than a parser rewrite.
+
+Validation: full race suites on Linux and macOS, vet and configured linters
+for the core and benchmark modules, and Windows cross-compilation. Carrier
+conformance covers TCP, TLS, batched TLS and Unix sockets. Regression tests
+check bulk/interactive chunking, complete payload ordering, short-write
+errors, wrapped raw-TCP half-close, and carrier-aware result aggregation.
+
+To repeat on another cluster, apply `kube/pods.yaml` with an explicit
+kubeconfig and context. Build the same `bench` harness against both library
+revisions; place `bench-control.test`, `bench-after.test`, `remote-control`
+and `remote-after` under `/bench` on the workers. On the server start the
+control at port 7778 and the candidate at 7779. On the client run
+`SERVER=<server-pod-ip> REPS=6 sh compare.sh`; after network tests finish,
+run `ROOT=/bench REPS=6 sh loopback.sh` on an idle worker. TLS modes use an
+ephemeral unauthenticated certificate for this trusted benchmark network.
+Delete the worker pods after collecting results; the namespace can be reused.
