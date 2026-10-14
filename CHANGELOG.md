@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1](https://github.com/giraffesyo/portunus/compare/v0.1.0...v0.1.1) (2026-10-14)
+
+
+### Bug Fixes
+
+* **deps:** require Go 1.27.2 and lift golang.org/x/net to v0.60.0 for their security fixes ([#2](https://github.com/giraffesyo/portunus/issues/2)) ([80803fc](https://github.com/giraffesyo/portunus/commit/80803fc27d1b530c888b6c47f693bd0e261916df))
+
+
+### Performance
+
+* optimize Unix socket and wrapped carrier writes ([8fa7dac](https://github.com/giraffesyo/portunus/commit/8fa7dac83dcaeb2401d4a3649ade11057d35ae5f))
+
 ## 0.1.0 (2026-10-03)
 
 
