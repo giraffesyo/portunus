@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/giraffesyo/portunus/compare/v0.1.1...v0.1.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* **deps:** build with Go 1.27.3, which distrusts eMudhra's compromised intermediate CAs ([#4](https://github.com/giraffesyo/portunus/issues/4)) ([09b9032](https://github.com/giraffesyo/portunus/commit/09b9032fdb2d22724787e9e1513d2946923f6028))
+
 ## [0.1.1](https://github.com/giraffesyo/portunus/compare/v0.1.0...v0.1.1) (2026-10-14)
 
 
